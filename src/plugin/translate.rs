@@ -124,7 +124,7 @@ impl Plugin for TranslatePlugin {
                     }
                 }
             }
-            AgentEvent::Done(_) | AgentEvent::Error(_) => {
+            AgentEvent::Done(_) | AgentEvent::Error { .. } => {
                 *self.active_idx.lock().unwrap() = None;
                 self.buffer.lock().unwrap().clear();
             }

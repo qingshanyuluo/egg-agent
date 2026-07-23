@@ -103,8 +103,18 @@ pub fn list() -> Result<Vec<SessionInfo>> {
                         .find(|m| m.role == "user")
                         .and_then(|m| m.content.as_deref())
                         .map(|c| {
+                            // Use char_indices to find a safe UTF-8 boundary
+                            let mut end = 80;
                             if c.len() > 80 {
-                                format!("{}…", &c[..80])
+                                // Find the last char boundary at or before byte 80
+                                if let Some((idx, _)) = c.char_indices().take_while(|(i, _)| *i <= 80).last() {
+                                    end = idx;
+                                    // Add the char's byte length to include it
+                                    if let Some(ch) = c[idx..].chars().next() {
+                                        end += ch.len_utf8();
+                                    }
+                                }
+                                format!("{}…", &c[..end.min(c.len())])
                             } else {
                                 c.to_string()
                             }

@@ -38,6 +38,10 @@ pub struct Message {
     /// Whether a long tool output is collapsed to a preview. Starts `true`;
     /// toggled by clicking the output's header row.
     pub output_collapsed: bool,
+    /// Whether a tool call line is collapsed to a one-line summary.
+    /// Tool calls default to expanded (false); bash commands with long args
+    /// can be collapsed by the user.
+    pub tool_collapsed: bool,
 }
 
 impl Message {
@@ -52,6 +56,7 @@ impl Message {
             explanation: None,
             full_content: None,
             output_collapsed: true,
+            tool_collapsed: false,
         }
     }
 }
@@ -66,10 +71,20 @@ pub struct SlashCommand {
 }
 
 /// Built-in slash commands. Plugin-contributed commands are merged in at runtime.
-pub const COMMANDS: &[SlashCommand] = &[SlashCommand {
-    name: "model",
-    description: "Switch the active model",
-}];
+pub const COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "model",
+        description: "Switch the active model",
+    },
+    SlashCommand {
+        name: "connect",
+        description: "Connect a provider: /connect <name> <api_key> [base_url]",
+    },
+    SlashCommand {
+        name: "connect-remove",
+        description: "Remove a provider: /connect-remove <name>",
+    },
+];
 
 // ---- Modal overlays ----
 
@@ -81,6 +96,18 @@ pub enum Overlay {
     CommandMenu { filter: String, selected: usize },
     /// The model picker, fetched live from the provider.
     ModelPicker(ModelPicker),
+    /// Interactive form to add a new API provider step by step.
+    ConnectWizard(ConnectWizard),
+}
+
+/// State for the interactive provider-connection wizard.
+#[derive(Debug, Clone)]
+pub struct ConnectWizard {
+    /// Which field is currently focused: 0 = name, 1 = api_key, 2 = base_url
+    pub field: usize,
+    pub name: String,
+    pub api_key: String,
+    pub base_url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +145,8 @@ pub enum OverlayAction {
     FetchModels,
     /// Apply and persist the chosen model.
     ApplyModel(String),
+    /// Save the newly connected provider: (name, api_key, base_url).
+    ConnectProvider { name: String, api_key: String, base_url: String },
     /// A plugin-registered command was selected; the main loop should
     /// dispatch it through the plugin registry.
     PluginCommand(String),

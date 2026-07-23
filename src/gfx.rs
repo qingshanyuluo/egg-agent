@@ -47,21 +47,88 @@ pub fn first_lines(s: &str, max: usize) -> String {
     }
 }
 
-/// Render tool-call arguments compactly: unwrap a single-key JSON object to just
-/// its value (e.g. `{"command":"ls"}` -> `ls`), otherwise show a one-line JSON.
-pub fn compact_args(args: &str) -> String {
+/// Render a tool call as a compact one-liner: `bash  ls -la`, `read_file  src/main.rs`,
+/// `edit_file  app.rs  (±12 lines)`, etc.  Content-heavy arguments are never dumped
+/// into the transcript — only paths, sizes, and line counts.
+pub fn tool_call_label(name: &str, args: &str) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
-        return args.trim().to_string();
+        return format!("{name}  {}", args.trim());
     };
-    if let Some(obj) = value.as_object() {
-        if obj.len() == 1 {
-            if let Some(v) = obj.values().next() {
-                if let Some(s) = v.as_str() {
-                    return s.to_string();
-                }
-                return v.to_string();
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return format!("{name}  {value}"),
+    };
+
+    match name {
+        "bash" => {
+            if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+                format!("bash  {cmd}")
+            } else {
+                format!("bash  {value}")
             }
         }
+        "read_file" => {
+            if let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
+                format!("read_file  {p}")
+            } else {
+                format!("read_file  {value}")
+            }
+        }
+        "write_file" => {
+            if let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
+                let n = obj
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|c| c.len())
+                    .unwrap_or(0);
+                format!("write_file  {p}  ({n} bytes)")
+            } else {
+                format!("write_file  {value}")
+            }
+        }
+        "edit_file" => {
+            if let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
+                let old = obj
+                    .get("old_string")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let new = obj
+                    .get("new_string")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let old_lines = old.lines().count();
+                let new_lines = new.lines().count();
+                if old_lines == new_lines {
+                    format!("edit_file  {p}  ({old_lines} lines)")
+                } else {
+                    let added = new_lines.saturating_sub(old_lines);
+                    let removed = old_lines.saturating_sub(new_lines);
+                    format!("edit_file  {p}  (+{added} / -{removed} lines)")
+                }
+            } else {
+                format!("edit_file  {value}")
+            }
+        }
+        "search" => {
+            let pat = obj
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            if let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
+                if p != "." {
+                    return format!("search  \"{pat}\"  in {p}");
+                }
+            }
+            format!("search  \"{pat}\"")
+        }
+        _ => {
+            // Unknown / future tool: single-key unwrap, else compact JSON.
+            if obj.len() == 1 {
+                if let Some(v) = obj.values().next().and_then(|v| v.as_str()) {
+                    return format!("{name}  {v}");
+                }
+            }
+            format!("{name}  {value}")
+        }
     }
-    value.to_string()
 }

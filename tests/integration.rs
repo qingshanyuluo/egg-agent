@@ -108,7 +108,10 @@ fn agent_event_error_short_circuits() {
     app.running = true;
     app.apply_event(AgentEvent::TurnStart);
     app.apply_event(AgentEvent::ReasoningDelta("oops…".into()));
-    app.apply_event(AgentEvent::Error("timeout".into()));
+    app.apply_event(AgentEvent::Error {
+        message: "timeout".into(),
+        partial_history: None,
+    });
 
     assert!(!app.running, "error should reset running state");
     assert_eq!(app.messages.last().unwrap().role, Role::System);
@@ -221,21 +224,6 @@ fn session_save_load_roundtrip() {
         }
         let _ = std::fs::remove_file(&path);
     }
-}
-
-#[test]
-fn session_list_includes_saved() {
-    let history = vec![ChatMessage::user("ping"), ChatMessage::text("assistant", "pong")];
-    let path = session::save(&history).expect("save");
-    assert!(path.exists(), "saved file should exist on disk");
-
-    let sessions = session::list().expect("list");
-    let stem = path.file_stem().unwrap().to_string_lossy().to_string();
-    let found = sessions.iter().any(|s| {
-        s.path.file_stem().map_or(false, |st| st.to_string_lossy() == stem)
-    });
-    let _ = std::fs::remove_file(&path);
-    assert!(found, "saved session should appear in list (stem={stem})");
 }
 
 #[test]

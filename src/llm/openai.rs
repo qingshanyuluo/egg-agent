@@ -15,19 +15,24 @@ use super::{ChatMessage, FunctionCall, LlmClient, StreamEvent, ToolCall, ToolDef
 
 pub struct OpenAiClient {
     http: reqwest::Client,
-    base_url: String,
-    api_key: String,
-    /// Shared so `/model` can switch the active model at runtime without
-    /// rebuilding the client or the agent's `Arc<dyn LlmClient>`.
+    /// Shared so `/model` (and provider switching) can change credentials
+    /// at runtime without rebuilding the client or agent's `Arc<dyn LlmClient>`.
+    base_url: Mutex<String>,
+    api_key: Mutex<String>,
     model: Arc<Mutex<String>>,
 }
 
 impl OpenAiClient {
-    /// 15 s to establish the TCP+TLS connection; 5 min total for the
-    /// request (a streaming chat completion can legitimately take a
-    /// couple of minutes with tool calls, but longer means it's hung).
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-    const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+    /// 10 s to establish the TCP+TLS connection.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// 2 min hard cap on a single HTTP request (streaming + tool calls).
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+    /// If no chunk arrives within this window the stream is considered dead.
+    /// More lenient for the first chunk (TTFT can be 5-15 s for large models);
+    /// aggressive for subsequent chunks (a healthy stream pushes tokens every
+    /// few hundred ms — a 5 s gap means the connection is stalled).
+    const FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+    const NEXT_CHUNK_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn build_http() -> reqwest::Client {
         reqwest::Client::builder()
@@ -40,8 +45,8 @@ impl OpenAiClient {
     pub fn new(config: &Config) -> Self {
         Self {
             http: Self::build_http(),
-            base_url: config.base_url.clone(),
-            api_key: config.api_key.clone(),
+            base_url: Mutex::new(config.base_url.clone()),
+            api_key: Mutex::new(config.api_key.clone()),
             model: Arc::new(Mutex::new(config.model.clone())),
         }
     }
@@ -51,23 +56,29 @@ impl OpenAiClient {
     pub fn with_params(base_url: &str, api_key: &str, model: &str) -> Self {
         Self {
             http: Self::build_http(),
-            base_url: base_url.to_string(),
-            api_key: api_key.to_string(),
+            base_url: Mutex::new(base_url.to_string()),
+            api_key: Mutex::new(api_key.to_string()),
             model: Arc::new(Mutex::new(model.to_string())),
         }
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.base_url
+    pub fn base_url(&self) -> String {
+        self.base_url.lock().unwrap().clone()
     }
 
-    pub fn api_key(&self) -> &str {
-        &self.api_key
+    pub fn api_key(&self) -> String {
+        self.api_key.lock().unwrap().clone()
     }
 
     /// Switch the active model. Takes effect on the next request.
     pub fn set_model(&self, model: impl Into<String>) {
         *self.model.lock().unwrap() = model.into();
+    }
+
+    /// Switch credentials to a different provider. Takes effect on the next request.
+    pub fn set_provider(&self, base_url: &str, api_key: &str) {
+        *self.base_url.lock().unwrap() = base_url.to_string();
+        *self.api_key.lock().unwrap() = api_key.to_string();
     }
 
     fn current_model(&self) -> String {
@@ -294,9 +305,10 @@ impl Accumulator {
 
 #[async_trait]
 impl LlmClient for OpenAiClient {
-    /// Stream one chat completion with aggressive retry: up to 3 retries on
-    /// transient errors (timeout, 5xx, 429, connection reset), with short
-    /// back-off so the UI doesn't sit frozen for minutes.
+    /// Stream one chat completion. Retries on pre-stream errors (connection
+    /// refused, 5xx, 429) but NOT on in-stream stalls — a stalled stream means
+    /// the server accepted the request and then stopped producing; retrying the
+    /// same request would just hit the same slow/broken generation path.
     async fn chat_stream(
         &self,
         messages: &[ChatMessage],
@@ -304,15 +316,15 @@ impl LlmClient for OpenAiClient {
         events: &UnboundedSender<StreamEvent>,
     ) -> Result<ChatMessage> {
         const MAX_RETRIES: usize = 3;
-        let mut last_err: Option<anyhow::Error> = None;
 
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                // 400ms → 800ms → 1600ms
                 let delay = Duration::from_millis(400 * (1 << (attempt - 1)));
-                log::warn!(
-                    "llm: retry {attempt}/{MAX_RETRIES} after {delay:?}, last error: {last_err:?}"
-                );
+                // Let the UI show what's happening.
+                let _ = events.send(StreamEvent::Content(format!(
+                    "\n\n[⟳ retry {attempt}/{MAX_RETRIES} in {}ms…]\n",
+                    delay.as_millis()
+                )));
                 tokio::time::sleep(delay).await;
             }
 
@@ -324,16 +336,23 @@ impl LlmClient for OpenAiClient {
                     return Ok(msg);
                 }
                 Err(e) => {
+                    let is_stall = format!("{e:#}").to_lowercase().contains("stalled");
+                    if is_stall {
+                        // In-stream stall — retrying won't help.
+                        log::warn!("llm: stream stalled, not retrying: {e:#}");
+                        return Err(e);
+                    }
                     if !is_retryable(&e) {
                         return Err(e);
                     }
                     log::warn!("llm: attempt {} failed: {e:#}", attempt + 1);
-                    last_err = Some(e);
                 }
             }
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("LLM call failed after {MAX_RETRIES} retries")))
+        Err(anyhow::anyhow!(
+            "LLM call failed after {MAX_RETRIES} retries"
+        ))
     }
 }
 
@@ -346,7 +365,7 @@ impl OpenAiClient {
         tools: &[ToolDef],
         events: &UnboundedSender<StreamEvent>,
     ) -> Result<ChatMessage> {
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", self.base_url());
         let model = self.current_model();
         let body = ChatRequest {
             model: &model,
@@ -356,13 +375,19 @@ impl OpenAiClient {
             stream: true,
         };
 
-        let resp = self
+        // Cap the initial POST (connect + TLS + response headers) at 30 s.
+        // The reqwest Client timeout is a coarse total-request cap; this gives
+        // us a tighter bound on the round-trip before streaming even starts.
+        let req = self
             .http
             .post(&url)
-            .bearer_auth(&self.api_key)
+            .bearer_auth(&self.api_key())
             .json(&body)
-            .send()
+            .send();
+
+        let resp = tokio::time::timeout(Duration::from_secs(30), req)
             .await
+            .context("LLM API request timed out before response headers")?
             .context("failed to send request to LLM API")?;
 
         let status = resp.status();
@@ -374,10 +399,31 @@ impl OpenAiClient {
         let mut acc = Accumulator::default();
         let mut buf = String::new();
         let mut stream = resp.bytes_stream();
+        let mut first_chunk = true;
 
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk.context("error reading response stream")?;
-            buf.push_str(&String::from_utf8_lossy(&bytes));
+        loop {
+            let deadline = if first_chunk {
+                Self::FIRST_CHUNK_TIMEOUT
+            } else {
+                Self::NEXT_CHUNK_TIMEOUT
+            };
+
+            let chunk = match tokio::time::timeout(deadline, stream.next()).await {
+                Ok(Some(Ok(bytes))) => {
+                    first_chunk = false;
+                    bytes
+                }
+                Ok(Some(Err(e))) => {
+                    return Err(e).context("error reading response stream");
+                }
+                Ok(None) => break,
+                Err(_elapsed) => {
+                    let label = if first_chunk { "first token" } else { "stream" };
+                    bail!("{label} stalled — no data for {} s", deadline.as_secs());
+                }
+            };
+
+            buf.push_str(&String::from_utf8_lossy(&chunk));
 
             // Process complete lines; keep any trailing partial line in `buf`.
             while let Some(nl) = buf.find('\n') {
@@ -385,7 +431,7 @@ impl OpenAiClient {
                 buf.drain(..=nl);
 
                 let Some(payload) = line.strip_prefix("data:") else {
-                    continue; // skip blank lines, comments, event: lines
+                    continue;
                 };
                 let payload = payload.trim();
                 if payload.is_empty() {
@@ -408,7 +454,6 @@ impl OpenAiClient {
                             acc.apply(choice.delta, events);
                         }
                     }
-                    // Some providers interleave keep-alive / non-chunk JSON; ignore.
                     Err(_) => continue,
                 }
             }
@@ -432,6 +477,7 @@ fn is_retryable(e: &anyhow::Error) -> bool {
     let s = format!("{e:#}").to_lowercase();
     s.contains("timed out")
         || s.contains("timeout")
+        || s.contains("stalled")       // per-chunk stall detection
         || s.contains("connection")
         || s.contains("500 ")
         || s.contains("502 ")

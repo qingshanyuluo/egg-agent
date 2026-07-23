@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, ModelPicker, Overlay, Role};
+use crate::app::{App, ConnectWizard, ModelPicker, Overlay, Role};
 
 /// Left margin so content doesn't hug the terminal edge.
 const PAD: &str = " ";
@@ -44,6 +44,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     for line in app.input.lines() {
         let w = UnicodeWidthStr::width(line).max(1) as u16;
         visual_rows += (w + inner_w - 1) / inner_w;
+    }
+    // str::lines() drops a trailing empty line, so if the user pressed
+    // Alt+Enter at the end of the input we need to account for the new
+    // blank line explicitly.
+    if app.input.ends_with('\n') {
+        visual_rows += 1;
     }
     let input_height = (visual_rows.max(1) + 2).min(12); // +2 borders, cap at 12
 
@@ -96,6 +102,7 @@ fn draw_overlay(frame: &mut Frame, app: &App, overlay: &Overlay, area: Rect) {
             draw_command_menu(frame, app, filter, *selected, area)
         }
         Overlay::ModelPicker(picker) => draw_model_picker(frame, app, picker, area),
+        Overlay::ConnectWizard(wiz) => draw_connect_wizard(frame, wiz, area),
     }
 }
 
@@ -196,7 +203,8 @@ fn draw_model_picker(frame: &mut Frame, app: &App, picker: &ModelPicker, area: R
                 .enumerate()
             {
                 let is_sel = i == *selected;
-                let is_current = **model == app.model;
+                let is_current = **model == app.model
+                    || model.starts_with(&format!("{} (", app.model));
                 let marker = if is_sel { "❯ " } else { "  " };
                 let cur = if is_current { " *" } else { "" };
                 let style = if is_sel {
@@ -221,6 +229,116 @@ fn draw_model_picker(frame: &mut Frame, app: &App, picker: &ModelPicker, area: R
     }
 }
 
+/// Render the interactive connect-provider wizard as a centered form.
+fn draw_connect_wizard(frame: &mut Frame, wiz: &ConnectWizard, area: Rect) {
+    let popup = centered(area, 70, 10);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" connect provider ");
+
+    let hint = " Tab/Enter · Esc to cancel ";
+    let block = block.title_bottom(hint);
+
+    let label_style = |focused: bool| -> Style {
+        if focused {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    };
+
+    let value_style = |focused: bool| -> Style {
+        if focused {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Provider name field.
+    lines.push(Line::from(vec![
+        Span::styled(" Name    ", label_style(wiz.field == 0)),
+        Span::styled(
+            if wiz.name.is_empty() && wiz.field != 0 {
+                "(e.g. deepseek)"
+            } else {
+                &wiz.name
+            },
+            value_style(wiz.field == 0),
+        ),
+        Span::styled(
+            if wiz.field == 0 { " ▌" } else { "" },
+            Style::default().fg(Color::Cyan),
+        ),
+    ]));
+
+    // API Key field (masked display).
+    let masked_key = if wiz.api_key.is_empty() {
+        if wiz.field == 1 {
+            String::new()
+        } else {
+            "(sk-...)".to_string()
+        }
+    } else {
+        crate::cli::mask(&wiz.api_key)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" API Key ", label_style(wiz.field == 1)),
+        Span::styled(&masked_key, value_style(wiz.field == 1)),
+        Span::styled(
+            if wiz.field == 1 { " ▌" } else { "" },
+            Style::default().fg(Color::Cyan),
+        ),
+    ]));
+
+    // Base URL field.
+    let url_display = if wiz.base_url.is_empty() && wiz.field != 2 {
+        "https://api.openai.com/v1"
+    } else {
+        &wiz.base_url
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" Base URL", label_style(wiz.field == 2)),
+        Span::styled(url_display, value_style(wiz.field == 2)),
+        Span::styled(
+            if wiz.field == 2 { " ▌" } else { "" },
+            Style::default().fg(Color::Cyan),
+        ),
+    ]));
+
+    // Spacer.
+    lines.push(Line::from(""));
+
+    // Submit hint.
+    let submit_ready = !wiz.name.trim().is_empty() && !wiz.api_key.trim().is_empty();
+    if submit_ready {
+        lines.push(Line::from(Span::styled(
+            " ✓ Press Enter to save",
+            Style::default().fg(Color::Green),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " Fill in Name and API Key, then press Enter",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // Default for base_url.
+    if wiz.base_url.is_empty() || wiz.base_url == "https://api.openai.com/v1" {
+        lines.push(Line::from(Span::styled(
+            " (defaults to https://api.openai.com/v1)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
 
 fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     // Flatten the transcript into styled lines, then show the tail that fits so
@@ -228,6 +346,9 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     // Flat line index -> message index, for each clickable "thought" line.
     let mut thought_rows: Vec<(usize, usize)> = Vec::new();
+
+    // Flat line index -> message index, for each clickable tool line.
+    let mut tool_rows: Vec<(usize, usize)> = Vec::new();
 
     for (msg_idx, message) in app.messages.iter().enumerate() {
         let color = role_color(message.role);
@@ -310,13 +431,36 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
 
         for (i, text) in content_lines.iter().enumerate() {
             lines.push(match message.role {
-                Role::Tool => tool_call_line(i, text, color),
-                Role::ToolOutput => tool_output_line(text),
+                Role::Tool => {
+                    if message.tool_collapsed {
+                        // Collapsed: skip actual content, will add summary below.
+                        continue;
+                    } else {
+                        // Expanded: render with thin bar. The first line doubles as
+                        // the collapse hitbox — we record its position.
+                        if i == 0 {
+                            tool_rows.push((lines.len(), msg_idx));
+                        }
+                        tool_call_line(i, text, color)
+                    }
+                }
+                Role::ToolOutput => {
+                    if message.output_collapsed && message.full_content.is_some() {
+                        // Collapsed with full content available: skip preview entirely,
+                        // will render a one-line summary below.
+                        continue;
+                    } else {
+                        // Either expanded (showing full content) or short output
+                        // (no full_content): render normally.
+                        tool_output_line(text)
+                    }
+                }
                 _ => top_level_line(i, text, color, dim, message.role),
             });
         }
-        // Tool explanation (from BashExplainPlugin), shown below the tool call.
-        if message.role == Role::Tool {
+
+        // ---- Tool explanation (from BashExplainPlugin) ----
+        if message.role == Role::Tool && !message.tool_collapsed {
             if let Some(explanation) = &message.explanation {
                 if !explanation.is_empty() {
                     lines.push(Line::from(vec![
@@ -327,6 +471,67 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
                 }
             }
         }
+
+        // ---- Collapsible tool-call summary (Role::Tool, collapsed) ----
+        if message.role == Role::Tool && message.tool_collapsed {
+            let summary = message.content.lines().next().unwrap_or("");
+            tool_rows.push((lines.len(), msg_idx));
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(
+                    format!("▸ {summary}"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    "  (click to expand)",
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+
+        // ---- Collapsible tool-output (Role::ToolOutput) ----
+        if message.role == Role::ToolOutput {
+            if let Some(full) = &message.full_content {
+                if message.output_collapsed {
+                    // Collapsed: show a single summary line (no preview).
+                    let line_count = full.lines().count();
+                    tool_rows.push((lines.len(), msg_idx));
+                    lines.push(Line::from(vec![
+                        Span::raw("   "),
+                        Span::styled(
+                            format!("▸ output ({line_count} lines)"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            "  (click to expand)",
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                        ),
+                    ]));
+                } else {
+                    // Expanded: show collapse header + full output.
+                    let line_count = full.lines().count();
+                    tool_rows.push((lines.len(), msg_idx));
+                    lines.push(Line::from(vec![
+                        Span::raw("   "),
+                        Span::styled(
+                            format!("▾ output ({line_count} lines)"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            "  (click to collapse)",
+                            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                        ),
+                    ]));
+                    for text in full.lines() {
+                        lines.push(Line::from(vec![
+                            Span::raw("     "),
+                            Span::styled(text.to_string(), Style::default().fg(Color::DarkGray)),
+                        ]));
+                    }
+                }
+            }
+        }
+
         // Breathing room: no blank lines anywhere — dense output.
         // The ▌ bar on user messages provides the only visual turn separation.
     }
@@ -405,11 +610,26 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     log::debug!(
-        "hitboxes: {thought_count} thought_rows -> {} visible (total_visual={total_visual} height={height} term_w={term_w}) hitboxes={:?}",
-        hitboxes.len(),
-        hitboxes,
+        "hitboxes: {thought_count} thought_rows -> {n_visible} visible (area.y={a_y} area.h={a_h} total_v={total_visual} v_scroll={visual_scroll} term_w={term_w}) rows={hitboxes:?}",
+        n_visible = hitboxes.len(),
+        a_y = area.y,
+        a_h = area.height,
     );
     drop(hitboxes);
+
+    // --- Tool hitbox computation ---
+    let _tool_count = tool_rows.len();
+    let mut tool_hitboxes = app.tool_hitboxes.borrow_mut();
+    tool_hitboxes.clear();
+
+    for (flat_idx, msg_idx) in &tool_rows {
+        let screen_y =
+            area.y as isize + visual_pos[*flat_idx] as isize - visual_scroll as isize;
+        if screen_y >= 0 && (screen_y as u16) < area.y + area.height {
+            tool_hitboxes.push((screen_y as u16, *msg_idx));
+        }
+    }
+    drop(tool_hitboxes);
 
     // --- Record plaintext per screen row (for drag-select copy) + apply selection highlight ---
     let mut row_text = app.row_text.borrow_mut();
@@ -574,8 +794,14 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::DIM),
         ))]
     } else {
-        app.input
-            .lines()
+        let mut raw_lines: Vec<&str> = app.input.lines().collect();
+        // str::lines() drops a trailing empty line; add it back so the
+        // input box shows a blank line after the user presses Alt+Enter.
+        if app.input.ends_with('\n') {
+            raw_lines.push("");
+        }
+        raw_lines
+            .into_iter()
             .map(|l| Line::from(Span::raw(l.to_string())))
             .collect()
     };
@@ -598,17 +824,19 @@ fn input_cursor_pos(app: &App, area: Rect) -> (u16, u16) {
         return (inner.x, inner.y);
     }
 
-    // The last logical line and its display width.
-    let last_line: &str = text.rfind('\n').map_or(text, |p| &text[p + 1..]);
-    let col = UnicodeWidthStr::width(last_line) as u16;
+    // Split by \n but preserve the trailing empty line when input ends with \n.
+    let mut logical: Vec<&str> = text.lines().collect();
+    if text.ends_with('\n') {
+        logical.push("");
+    }
 
-    // Count visual rows consumed by all logical lines before the last.
-    let last_line_idx = text.lines().count().saturating_sub(1);
+    // The last logical line determines the cursor column.
+    let last = logical.pop().unwrap(); // safe: at least one element
+    let col = UnicodeWidthStr::width(last) as u16;
+
+    // All preceding logical lines contribute full wrapped rows.
     let mut visual_row = 0u16;
-    for (i, line) in text.lines().enumerate() {
-        if i == last_line_idx {
-            break;
-        }
+    for &line in &logical {
         let w = UnicodeWidthStr::width(line).max(1) as u16;
         visual_row += (w + inner_w - 1) / inner_w;
     }

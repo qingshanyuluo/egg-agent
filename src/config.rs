@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 
@@ -13,6 +14,12 @@ use serde::{Deserialize, Serialize};
 /// Stored as TOML at `~/.egg-agent/config.toml`. Environment variables
 /// (`EGG_API_KEY` / `EGG_BASE_URL` / `EGG_MODEL`) override the file when set,
 /// which is handy for one-off runs and CI.
+///
+/// # Multi-provider support
+///
+/// Named providers live under `[providers.<name>]`. Use `egg connect` to add
+/// them. The top-level `api_key` / `base_url` / `model` fields serve as the
+/// active (or "default") provider for backward compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub api_key: String,
@@ -26,6 +33,10 @@ pub struct Config {
     /// config when omitted.
     #[serde(default)]
     pub aux: Option<AuxConfig>,
+    /// Named providers configured via `egg connect`. Keyed by a short
+    /// user-chosen name (e.g. "deepseek", "groq").
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderConfig>,
 }
 
 /// Configuration for a secondary "auxiliary" model used by plugins.
@@ -46,6 +57,14 @@ pub struct AuxConfig {
     pub api_key: Option<String>,
 }
 
+/// A named API provider stored under `[providers.<name>]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    pub api_key: String,
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
+}
+
 fn default_base_url() -> String {
     "https://api.openai.com/v1".to_string()
 }
@@ -61,6 +80,7 @@ impl Default for Config {
             base_url: default_base_url(),
             model: default_model(),
             aux: None,
+            providers: HashMap::new(),
         }
     }
 }
@@ -154,6 +174,22 @@ impl Config {
 
         Ok(path)
     }
+
+    /// Return all configured providers as (name, api_key, base_url) triples.
+    /// The implicit "default" provider (from the top-level fields) is always
+    /// included first, followed by named providers in arbitrary order.
+    pub fn all_providers(&self) -> Vec<(&str, &str, &str)> {
+        let mut out = Vec::new();
+        if !self.api_key.trim().is_empty() {
+            out.push(("default", self.api_key.as_str(), self.base_url.as_str()));
+        }
+        for (name, p) in &self.providers {
+            if !p.api_key.trim().is_empty() {
+                out.push((name.as_str(), p.api_key.as_str(), p.base_url.as_str()));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +203,7 @@ mod tests {
             base_url: "https://example.com/v1".to_string(),
             model: "some-model".to_string(),
             aux: None,
+            providers: HashMap::new(),
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
@@ -183,5 +220,54 @@ mod tests {
         assert_eq!(cfg.base_url, "https://api.openai.com/v1");
         assert_eq!(cfg.model, "gpt-4o-mini");
         assert!(cfg.aux.is_none());
+    }
+
+    #[test]
+    fn providers_roundtrip() {
+        let text = r#"
+api_key = "sk-default"
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o"
+
+[providers.deepseek]
+api_key = "sk-deep"
+base_url = "https://api.deepseek.com/v1"
+
+[providers.groq]
+api_key = "sk-groq"
+base_url = "https://api.groq.com/v1"
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert_eq!(cfg.api_key, "sk-default");
+        assert_eq!(cfg.providers.len(), 2);
+        assert_eq!(cfg.providers.get("deepseek").unwrap().api_key, "sk-deep");
+        assert_eq!(cfg.providers.get("groq").unwrap().base_url, "https://api.groq.com/v1");
+
+        let all = cfg.all_providers();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0], ("default", "sk-default", "https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn all_providers_skips_empty_keys() {
+        let mut cfg = Config::default();
+        cfg.api_key = String::new(); // empty -> skipped
+        cfg.providers.insert(
+            "test".to_string(),
+            ProviderConfig {
+                api_key: "sk-test".to_string(),
+                base_url: "https://test.example.com/v1".to_string(),
+            },
+        );
+        cfg.providers.insert(
+            "empty".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                base_url: "https://empty.example.com/v1".to_string(),
+            },
+        );
+        let all = cfg.all_providers();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "test");
     }
 }

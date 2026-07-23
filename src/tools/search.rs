@@ -5,12 +5,16 @@
 //! and pie — shell out to a battle-tested search binary rather than
 //! reimplementing recursive regex search in Rust.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::process::Command;
+use tokio::process::Command;
 
 use super::{Tool, MAX_OUTPUT_CHARS};
+
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Search;
 
@@ -58,17 +62,15 @@ impl Tool for Search {
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or(".");
-        let include = args
-            .get("include")
-            .and_then(Value::as_str);
+        let include = args.get("include").and_then(Value::as_str);
 
-        // Prefer ripgrep — fast, .gitignore-aware, color-free JSON output.
-        if let Ok(output) = run_rg(pattern, search_path, include) {
+        // Prefer ripgrep — fast, .gitignore-aware.
+        if let Ok(output) = run_rg(pattern, search_path, include).await {
             return Ok(truncate_lines(&output));
         }
 
         // Fallback: GNU/BSD grep.
-        if let Ok(output) = run_grep(pattern, search_path, include) {
+        if let Ok(output) = run_grep(pattern, search_path, include).await {
             return Ok(truncate_lines(&output));
         }
 
@@ -76,43 +78,41 @@ impl Tool for Search {
     }
 }
 
-/// Try ripgrep: `rg --no-heading --line-number --color never <pattern> <path>`
-fn run_rg(pattern: &str, path: &str, include: Option<&str>) -> Result<String, std::io::Error> {
+/// Try ripgrep with a 30 s timeout.
+async fn run_rg(pattern: &str, path: &str, include: Option<&str>) -> Result<String> {
     let mut cmd = Command::new("rg");
     cmd.args(["--no-heading", "--line-number", "--color", "never"])
-        .arg("--max-count=200"); // cap per-file matches
+        .arg("--max-count=200");
 
     if let Some(glob) = include {
         cmd.arg("--glob").arg(glob);
     }
 
     cmd.arg("--").arg(pattern).arg(path);
-
-    // Don't search binary files.
-    cmd.arg("--no-ignore"); // we want to search all text files in workspace
+    cmd.arg("--no-ignore");
     cmd.arg("-g").arg("!*.{o,a,so,dylib,exe,dll,wasm,bin,class,pyc,pyd,jar,war,ear,zip,tar,gz,bz2,xz,7z,rar,png,jpg,jpeg,gif,bmp,ico,mp3,mp4,avi,mkv,pdf,doc,docx,xls,xlsx,ppt,pptx,ttf,otf,woff,woff2,eot,db,db3,sqlite,sqlite3}");
 
-    let output = cmd.output()?;
+    let fut = cmd.output();
+    let output = match tokio::time::timeout(SEARCH_TIMEOUT, fut).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(e).context("failed to spawn rg"),
+        Err(_) => bail!("search timed out after {:?}", SEARCH_TIMEOUT),
+    };
+
     if !output.status.success() {
-        // rg returns 1 for "no matches", which is not an error for us
         if output.status.code() == Some(1) && output.stdout.is_empty() {
             return Ok("(no matches)".to_string());
         }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("rg failed: {}", String::from_utf8_lossy(&output.stderr)),
-        ));
+        bail!("rg failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
-    let text = String::from_utf8_lossy(&output.stdout).to_string();
-    Ok(text)
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Fallback: `grep -rn --color=never <pattern> <path>`
-fn run_grep(pattern: &str, path: &str, include: Option<&str>) -> Result<String, std::io::Error> {
+/// Fallback grep with a 30 s timeout.
+async fn run_grep(pattern: &str, path: &str, include: Option<&str>) -> Result<String> {
     let mut cmd = Command::new("grep");
-    cmd.args(["-rn", "--color=never", "-I"]) // -I = skip binary
-        .arg("--max-count=200");
+    cmd.args(["-rn", "--color=never", "-I"]).arg("--max-count=200");
 
     if let Some(glob) = include {
         cmd.arg("--include").arg(glob);
@@ -120,14 +120,17 @@ fn run_grep(pattern: &str, path: &str, include: Option<&str>) -> Result<String, 
 
     cmd.arg(pattern).arg(path);
 
-    let output = cmd.output()?;
+    let fut = cmd.output();
+    let output = match tokio::time::timeout(SEARCH_TIMEOUT, fut).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(e).context("failed to spawn grep"),
+        Err(_) => bail!("search timed out after {:?}", SEARCH_TIMEOUT),
+    };
+
     match output.status.code() {
         Some(0) => Ok(String::from_utf8_lossy(&output.stdout).to_string()),
         Some(1) => Ok("(no matches)".to_string()),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("grep failed: {}", String::from_utf8_lossy(&output.stderr)),
-        )),
+        _ => bail!("grep failed: {}", String::from_utf8_lossy(&output.stderr)),
     }
 }
 

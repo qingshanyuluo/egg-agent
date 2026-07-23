@@ -1,6 +1,11 @@
 //! The agentic loop: alternate between LLM turns and tool execution until the
 //! model produces a final text answer. Each turn is streamed, so reasoning and
 //! content deltas reach the UI as they arrive.
+//!
+//! There is no artificial iteration cap — the loop runs until the model stops
+//! calling tools and produces a natural-language reply, or until a stream-level
+//! error (timeout / stall / network) occurs. The only guardrails are the
+//! per-chunk timeout (5s) and per-request timeout (120s) in the HTTP client.
 
 use std::sync::Arc;
 
@@ -8,10 +13,6 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::llm::{ChatMessage, LlmClient, StreamEvent};
 use crate::tools::ToolRegistry;
-
-/// Safety cap: stop after this many LLM round-trips so a misbehaving model
-/// can't loop on tools forever.
-const MAX_ITERS: usize = 12;
 
 const SYSTEM_PROMPT: &str = "You are egg-agent, a minimal software-engineering assistant running in a \
 terminal. You can read and write files and run shell commands via the provided tools. \
@@ -33,38 +34,45 @@ pub enum AgentEvent {
     ToolCall { name: String, args: String },
     /// A tool finished; `output` is what will be fed back to the model.
     ToolResult { output: String },
-    /// Something went wrong; the turn is over.
-    Error(String),
+    /// Something went wrong. `partial_history` carries the accumulated LLM
+    /// conversation (including any completed tool rounds) when the error
+    /// happened — `None` means "stream-level error with no progress".
+    Error {
+        message: String,
+        partial_history: Option<Vec<ChatMessage>>,
+    },
     /// The turn finished (success). Carries the updated history for the next turn.
     Done(Vec<ChatMessage>),
 }
 
-/// Run one full agent turn (possibly several LLM round-trips if tools are used).
+/// Run the agent loop: stream LLM turns, execute tools, repeat until the model
+/// produces a final answer or a stream error occurs. No artificial iteration limit.
 pub async fn run_agent(
     mut history: Vec<ChatMessage>,
     llm: Arc<dyn LlmClient>,
     tools: Arc<ToolRegistry>,
     tx: UnboundedSender<AgentEvent>,
 ) {
-    // Ensure a system prompt is at the front exactly once.
     if history.first().map(|m| m.role.as_str()) != Some("system") {
         history.insert(0, ChatMessage::system(SYSTEM_PROMPT));
     }
 
     let defs = tools.defs();
 
-    for _ in 0..MAX_ITERS {
+    loop {
         let _ = tx.send(AgentEvent::TurnStart);
 
         let msg = match stream_one_turn(&*llm, &history, &defs, &tx).await {
             Ok(m) => m,
             Err(e) => {
-                let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
+                let _ = tx.send(AgentEvent::Error {
+                    message: format!("{e:#}"),
+                    partial_history: None,
+                });
                 return;
             }
         };
 
-        // Record the assistant turn (may contain tool_calls and/or content).
         history.push(msg.clone());
 
         match msg.tool_calls {
@@ -85,19 +93,15 @@ pub async fn run_agent(
 
                     history.push(ChatMessage::tool_result(call.id, output));
                 }
-                // Loop again with the tool results appended.
+                // Continue loop — model can call more tools.
             }
             _ => {
-                // No tool calls -> final answer already streamed via ContentDelta.
+                // No tool calls → final answer.
                 let _ = tx.send(AgentEvent::Done(history));
                 return;
             }
         }
     }
-
-    let _ = tx.send(AgentEvent::Error(format!(
-        "reached max iterations ({MAX_ITERS}) without a final answer"
-    )));
 }
 
 /// Drive a single streamed LLM call, forwarding reasoning/content deltas to the
@@ -110,7 +114,6 @@ async fn stream_one_turn(
 ) -> anyhow::Result<ChatMessage> {
     let (stx, mut srx) = mpsc::unbounded_channel::<StreamEvent>();
 
-    // Forward stream deltas to the UI concurrently with the HTTP stream.
     let tx_fwd = tx.clone();
     let forwarder = tokio::spawn(async move {
         while let Some(ev) = srx.recv().await {
@@ -123,7 +126,7 @@ async fn stream_one_turn(
     });
 
     let result = llm.chat_stream(history, defs, &stx).await;
-    drop(stx); // close the channel so the forwarder finishes
+    drop(stx);
     let _ = forwarder.await;
     result
 }

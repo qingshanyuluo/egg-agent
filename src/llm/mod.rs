@@ -24,7 +24,7 @@ pub struct ChatMessage {
     /// Chain-of-thought. Received from streaming providers and preserved on the
     /// assembled message; never sent back (providers reject or ignore it on
     /// input), so it is skipped on serialize. Reserved for history/inspection.
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[allow(dead_code)]
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -16,7 +16,8 @@ use crate::llm::ChatMessage;
 
 // ---- Re-export domain types for zero-diff downstream imports ----
 pub use crate::types::{
-    COMMANDS, Message, ModelPicker, Overlay, OverlayAction, OverlayKey, Role, SlashCommand,
+    COMMANDS, ConnectWizard, Message, ModelPicker, Overlay, OverlayAction, OverlayKey, Role,
+    SlashCommand,
 };
 
 pub struct App {
@@ -55,7 +56,6 @@ pub struct App {
     pub thought_hitboxes: std::cell::RefCell<Vec<(u16, usize)>>,
     /// Screen rows (y) of collapsible tool-output header lines → message index.
     /// Rebuilt by the UI each frame, just like `thought_hitboxes`.
-    #[allow(dead_code)]
     pub tool_hitboxes: std::cell::RefCell<Vec<(u16, usize)>>,
     /// Total rendered height of the transcript in screen rows, including the
     /// off-screen portion, accounting for line wrapping at the current width.
@@ -93,6 +93,9 @@ pub struct App {
     /// The input being composed before the user navigated into history;
     /// restored when they scroll back past the newest entry.
     draft_input: String,
+    /// All configured providers: (name, api_key, base_url). Refreshed after
+    /// /connect or /connect-remove so the model picker stays in sync.
+    pub all_providers: Vec<(String, String, String)>,
 }
 
 impl App {
@@ -128,6 +131,7 @@ impl App {
             input_history: Vec::new(),
             history_cursor: None,
             draft_input: String::new(),
+            all_providers: Vec::new(),
         }
     }
 
@@ -165,6 +169,15 @@ impl App {
                 self.reasoning_started = None;
                 self.streaming_idx = None;
                 self.scroll_back = 0;
+                // Auto-collapse all tool outputs from previous turns (like reasoning).
+                for msg in &mut self.messages {
+                    if msg.role == Role::ToolOutput && msg.full_content.is_some() {
+                        msg.output_collapsed = true;
+                    }
+                    if msg.role == Role::Tool {
+                        msg.tool_collapsed = true;
+                    }
+                }
             }
             AgentEvent::ReasoningDelta(delta) => {
                 self.first_token_arrived();
@@ -195,27 +208,39 @@ impl App {
                     }
                 }
                 self.finish_stream_message();
-                self.messages.push(Message::new(
-                    Role::Tool,
-                    format!("{name}  {}", gfx::compact_args(&args)),
-                ));
+                self.messages
+                    .push(Message::new(Role::Tool, gfx::tool_call_label(&name, &args)));
             }
             AgentEvent::ToolResult { output } => {
-                let trimmed = output.trim_end();
-                let long = trimmed.lines().count() > 12;
-                let mut msg = Message::new(Role::ToolOutput, gfx::first_lines(trimmed, 12));
-                if long {
-                    msg.full_content = Some(trimmed.to_string());
-                    msg.output_collapsed = true;
-                } else {
-                    msg.output_collapsed = false;
-                }
+                let trimmed = output.trim_end().to_string();
+                let mut msg = Message::new(Role::ToolOutput, gfx::first_lines(&trimmed, 12));
+                // Always keep full content so every output is collapsible.
+                msg.full_content = Some(trimmed);
+                msg.output_collapsed = false; // show expanded initially, auto-collapse next turn
                 self.messages.push(msg);
             }
-            AgentEvent::Error(e) => {
+            AgentEvent::Error {
+                message,
+                partial_history,
+            } => {
+                // Save partial progress to history so resume doesn't lose it.
+                if let Some(h) = partial_history {
+                    // Agent accumulated a full history (e.g. max-iterations).
+                    self.history = h;
+                } else if let Some(i) = self.streaming_idx {
+                    // Stream-level error: save whatever content was shown in the UI.
+                    let msg = &self.messages[i];
+                    if !msg.content.is_empty() || !msg.reasoning.is_empty() {
+                        let mut partial = ChatMessage::text("assistant", &msg.content);
+                        if !msg.reasoning.is_empty() {
+                            partial.reasoning_content = Some(msg.reasoning.clone());
+                        }
+                        self.history.push(partial);
+                    }
+                }
                 self.finish_stream_message();
                 self.messages
-                    .push(Message::new(Role::System, format!("error: {e}")));
+                    .push(Message::new(Role::System, format!("error: {message}")));
                 self.reset_run_state();
             }
             AgentEvent::Done(history) => {
@@ -368,28 +393,40 @@ impl App {
                     }
                 }
                 "assistant" => {
-                    let mut m =
-                        Message::new(Role::Assistant, msg.content.clone().unwrap_or_default());
-                    if let Some(ref r) = msg.reasoning_content {
-                        if !r.is_empty() {
-                            m.reasoning = r.clone();
+                    // Reasoning (chain-of-thought) attached to this turn.
+                    let reasoning = msg.reasoning_content.clone().unwrap_or_default();
+                    let content = msg.content.clone().unwrap_or_default();
+
+                    // Assistant text / reasoning first (the model "thinks" then
+                    // acts, so reasoning/content appears before tool calls).
+                    if !content.is_empty() || !reasoning.is_empty() {
+                        let mut m = Message::new(Role::Assistant, content);
+                        if !reasoning.is_empty() {
+                            m.reasoning = reasoning;
                             m.reasoning_collapsed = true;
                             m.reasoning_secs = Some(0);
                         }
+                        self.messages.push(m);
                     }
-                    self.messages.push(m);
+
+                    // Tool calls embedded in the assistant turn.
+                    if let Some(ref calls) = msg.tool_calls {
+                        for tc in calls {
+                            self.messages.push(Message::new(
+                                Role::Tool,
+                                gfx::tool_call_label(&tc.function.name, &tc.function.arguments),
+                            ));
+                        }
+                    }
                 }
                 "tool" => {
                     if let Some(ref c) = msg.content {
-                        let trimmed = c.trim_end();
+                        let trimmed = c.trim_end().to_string();
                         let mut m =
-                            Message::new(Role::ToolOutput, gfx::first_lines(trimmed, 12));
-                        if trimmed.lines().count() > 12 {
-                            m.full_content = Some(trimmed.to_string());
-                            m.output_collapsed = true;
-                        } else {
-                            m.output_collapsed = false;
-                        }
+                            Message::new(Role::ToolOutput, gfx::first_lines(&trimmed, 12));
+                        // Always keep full content for collapsible output.
+                        m.full_content = Some(trimmed);
+                        m.output_collapsed = true; // resumed sessions start collapsed
                         self.messages.push(m);
                     }
                 }
@@ -417,12 +454,47 @@ impl App {
     // ---- Paste & clipboard ----
 
     pub fn paste(&mut self, text: &str) {
-        if self.running || self.overlay.is_some() {
+        if self.running {
+            return;
+        }
+        // When an overlay is open, inject the pasted text into its active field.
+        if self.overlay.is_some() {
+            self.paste_overlay(text);
             return;
         }
         self.input.push_str(text);
         self.history_cursor = None;
         self.draft_input.clear();
+    }
+
+    /// Inject pasted text into the active overlay's text field (filter or form field).
+    fn paste_overlay(&mut self, text: &str) {
+        let Some(overlay) = self.overlay.take() else { return };
+        let sanitized = text.replace('\n', " ").replace('\r', " ");
+        match overlay {
+            Overlay::CommandMenu { mut filter, selected } => {
+                filter.push_str(&sanitized);
+                self.overlay = Some(Overlay::CommandMenu { filter, selected });
+            }
+            Overlay::ModelPicker(picker) => match picker {
+                ModelPicker::Ready { all, mut filter, selected } => {
+                    filter.push_str(&sanitized);
+                    self.overlay = Some(Overlay::ModelPicker(ModelPicker::Ready { all, filter, selected }));
+                }
+                other => {
+                    self.overlay = Some(Overlay::ModelPicker(other));
+                }
+            },
+            Overlay::ConnectWizard(mut wiz) => {
+                match wiz.field {
+                    0 => wiz.name.push_str(&sanitized),
+                    1 => wiz.api_key.push_str(&sanitized),
+                    2 => wiz.base_url.push_str(&sanitized),
+                    _ => {}
+                }
+                self.overlay = Some(Overlay::ConnectWizard(wiz));
+            }
+        }
     }
 
     pub fn selection_rows(&self) -> Option<(u16, u16)> {
@@ -465,6 +537,16 @@ impl App {
         });
     }
 
+    /// Open the interactive connect-wizard overlay to add a new provider.
+    pub fn open_connect_wizard(&mut self) {
+        self.overlay = Some(Overlay::ConnectWizard(ConnectWizard {
+            field: 0,
+            name: String::new(),
+            api_key: String::new(),
+            base_url: String::from("https://api.openai.com/v1"),
+        }));
+    }
+
     /// Commands matching the current command-menu filter (prefix match).
     /// Merges built-in commands with plugin-contributed commands.
     pub fn filtered_commands(&self, filter: &str) -> Vec<SlashCommand> {
@@ -493,6 +575,7 @@ impl App {
             return OverlayAction::None;
         };
         match overlay {
+            Overlay::ConnectWizard(wiz) => self.connect_wizard_key(wiz, key),
             Overlay::CommandMenu {
                 mut filter,
                 mut selected,
@@ -582,11 +665,84 @@ impl App {
         }
     }
 
+    fn connect_wizard_key(
+        &mut self,
+        mut wiz: ConnectWizard,
+        key: OverlayKey,
+    ) -> OverlayAction {
+        match key {
+            OverlayKey::Esc => return OverlayAction::None,
+            OverlayKey::Enter => {
+                // Enter on the last field (base_url) submits the form.
+                if wiz.field == 2 && !wiz.name.trim().is_empty() && !wiz.api_key.trim().is_empty() {
+                    let name = wiz.name.trim().to_lowercase();
+                    let api_key = wiz.api_key.trim().to_string();
+                    let base_url = wiz.base_url.trim().trim_end_matches('/').to_string();
+                    let base_url = if base_url.is_empty() {
+                        "https://api.openai.com/v1".to_string()
+                    } else {
+                        base_url
+                    };
+                    return OverlayAction::ConnectProvider {
+                        name,
+                        api_key,
+                        base_url,
+                    };
+                }
+                // Otherwise, advance to next field.
+                wiz.field = (wiz.field + 1).min(2);
+            }
+            OverlayKey::Char('\t') => {
+                // Tab cycles forward through fields.
+                wiz.field = (wiz.field + 1) % 3;
+            }
+            OverlayKey::Up => {
+                // Shift focus to previous field.
+                wiz.field = if wiz.field == 0 { 2 } else { wiz.field - 1 };
+            }
+            OverlayKey::Down => {
+                // Shift focus to next field.
+                wiz.field = (wiz.field + 1) % 3;
+            }
+            OverlayKey::Backspace => {
+                match wiz.field {
+                    0 => { wiz.name.pop(); }
+                    1 => { wiz.api_key.pop(); }
+                    2 => { wiz.base_url.pop(); }
+                    _ => {}
+                }
+            }
+            OverlayKey::Char(c) => {
+                match wiz.field {
+                    0 => wiz.name.push(c),
+                    1 => wiz.api_key.push(c),
+                    2 => wiz.base_url.push(c),
+                    _ => {}
+                }
+            }
+        }
+        self.overlay = Some(Overlay::ConnectWizard(wiz));
+        OverlayAction::None
+    }
+
     fn run_command(&mut self, name: &str) -> OverlayAction {
         match name {
             "model" => {
                 self.overlay = Some(Overlay::ModelPicker(ModelPicker::Loading));
                 OverlayAction::FetchModels
+            }
+            "connect" => {
+                self.open_connect_wizard();
+                OverlayAction::None
+            }
+            "connect-remove" => {
+                // This command needs an argument; pre-fill the input and let the
+                // user type the rest, then handle on Enter.
+                self.overlay = None;
+                self.input = format!("/{name} ");
+                self.history_cursor = None;
+                self.draft_input.clear();
+                OverlayAction::None
             }
             other => {
                 if self.plugin_commands.iter().any(|c| c.name == other) {
@@ -620,6 +776,15 @@ impl App {
         self.overlay = None;
         self.messages
             .push(Message::new(Role::System, format!("switched model to {model}")));
+    }
+
+    /// Refresh the cached provider list from config (called after /connect etc.).
+    pub fn refresh_providers(&mut self, config: &crate::config::Config) {
+        self.all_providers = config
+            .all_providers()
+            .into_iter()
+            .map(|(n, k, u)| (n.to_string(), k.to_string(), u.to_string()))
+            .collect();
     }
 
     /// Handle a click inside an overlay at row `y`. Returns an action.

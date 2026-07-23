@@ -1,12 +1,13 @@
 use std::io::{self, Stdout};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -25,6 +26,7 @@ use egg_agent::llm::openai::OpenAiClient;
 use egg_agent::plugin::{self, PluginEvent};
 use egg_agent::session;
 use egg_agent::tools::ToolRegistry;
+use egg_agent::types::{Message, Role};
 use egg_agent::ui;
 
 /// Restore the terminal to its pre-TUI state. Best-effort: every step ignores
@@ -79,17 +81,24 @@ impl Drop for TerminalGuard {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env("EGG_LOG")
+    // Persistent log file so we can diagnose hangs after the fact.
+    let log_dir = dirs::home_dir()
+        .context("cannot determine home directory")?
+        .join(".egg-agent");
+    std::fs::create_dir_all(&log_dir).ok();
+    let log_file = std::fs::File::create(log_dir.join("egg.log"))
+        .context("cannot create egg.log")?;
+    let mut log_builder = env_logger::Builder::from_env("EGG_LOG");
+    if std::env::var("EGG_LOG").is_err() {
+        log_builder.filter_level(log::LevelFilter::Debug); // capture everything by default
+    }
+    log_builder
         .format_timestamp_millis()
-        .target(env_logger::Target::Stderr)
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
         .init();
     match cli::parse_args() {
         Command::Run => run_tui().await,
         Command::Resume(id) => run_tui_resume(id).await,
-        Command::Config => cli::run_wizard().await,
-        Command::Model => cli::run_model_switch().await,
-        Command::ConfigPath => cli::print_config_path(),
-        Command::ConfigShow => cli::print_config_show(),
         Command::Help => {
             cli::print_help();
             Ok(())
@@ -167,7 +176,7 @@ async fn run_tui() -> Result<()> {
 async fn run_tui_with(pending_history: Option<Vec<ChatMessage>>) -> Result<()> {
     // Build the backend before touching the terminal, so config errors print cleanly.
     let config = Config::load()?;
-    let provider = provider_label(&config.base_url);
+    let provider = cli::provider_label(&config.base_url);
     let model = config.model.clone();
     // Keep a concrete handle so `/model` can switch the live model and we can
     // fetch the model list; the agent uses the same instance via the trait object.
@@ -206,6 +215,7 @@ async fn run_tui_with(pending_history: Option<Vec<ChatMessage>>) -> Result<()> {
 
     let mut app = App::new(model, provider);
     app.plugin_commands = plugins.all_commands();
+    app.refresh_providers(&config);
     if let Some(history) = pending_history {
         app.apply_resume(history);
     }
@@ -271,6 +281,11 @@ async fn run(
     // CPU (and flood the terminal) by redrawing on every idle poll timeout.
     let mut dirty = true;
 
+    // Track the last Esc press time to detect Alt+Enter / Option+Enter (Esc
+    // followed quickly by Enter) for inserting newlines without the kitty
+    // keyboard protocol (which interferes with bracketed paste).
+    let mut last_esc: Option<Instant> = None;
+
     while !app.should_quit {
         if dirty {
             terminal.draw(|frame| ui::draw(frame, app))?;
@@ -326,6 +341,14 @@ async fn run(
             if animating {
                 dirty = true;
             }
+            // If Esc was pressed but no key followed in time, clear input.
+            if let Some(t) = last_esc {
+                if t.elapsed() >= Duration::from_millis(200) {
+                    app.clear_input();
+                    last_esc = None;
+                    dirty = true;
+                }
+            }
             continue;
         }
         match event::read()? {
@@ -348,8 +371,13 @@ async fn run(
                     KeyCode::Esc => {
                         if app.running {
                             app.cancel_session();
+                        } else if app.overlay_active() {
+                            // Esc in overlay: let the overlay handle it via the
+                            // overlay key path below.
                         } else {
-                            app.clear_input();
+                            // Record the time so we can detect Alt+Enter (Esc
+                            // followed quickly by Enter) for inserting newlines.
+                            last_esc = Some(Instant::now());
                         }
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -362,15 +390,42 @@ async fn run(
                         app.open_command_menu();
                     }
                     KeyCode::Enter => {
-                        // Shift+Enter or Alt+Enter (Option+Enter on macOS) inserts
-                        // a newline. Shift works in iTerm2/Ghostty/kitty; Alt works
-                        // in the default macOS Terminal.app and everywhere else.
-                        let mods = key.modifiers;
-                        let newline = (mods.contains(KeyModifiers::SHIFT)
-                            || mods.contains(KeyModifiers::ALT))
-                            && !app.running;
-                        if newline {
+                        // Detect Alt+Enter / Option+Enter: Esc followed quickly
+                        // by Enter inserts a newline. Shift+Enter still works
+                        // natively in most terminals without the kitty protocol.
+                        let esc_newline = last_esc
+                            .map(|t| t.elapsed() < Duration::from_millis(200))
+                            .unwrap_or(false);
+                        last_esc = None;
+
+                        let shift_newline =
+                            key.modifiers.contains(KeyModifiers::SHIFT) && !app.running;
+
+                        if (esc_newline || shift_newline) && !app.running && !app.overlay_active() {
                             app.input_newline();
+                        } else if app.input.trim().starts_with('/') && !app.running {
+                            // Slash command: handle it directly.
+                            let input = app.input.clone();
+                            app.input.clear();
+
+                            // /model: open the model picker and start fetching.
+                            if input.trim() == "/model" {
+                                app.overlay = Some(egg_agent::app::Overlay::ModelPicker(
+                                    egg_agent::app::ModelPicker::Loading,
+                                ));
+                                let tx = ctl_tx.clone();
+                                let providers = app.all_providers.clone();
+                                tokio::spawn(async move {
+                                    let result = fetch_all_models(&providers).await;
+                                    let _ = tx.send(CtlEvent::ModelList(result));
+                                });
+                            } else if let Some(msg) = cli::handle_slash_command(&input, app) {
+                                app.messages.push(
+                                    egg_agent::app::Message::new(
+                                        egg_agent::app::Role::System, msg,
+                                    ),
+                                );
+                            }
                         } else if let Some(history) = app.take_submission() {
                             let llm = Arc::clone(&llm);
                             let tools = Arc::clone(&tools);
@@ -383,13 +438,24 @@ async fn run(
                     }
                     // Input history: Up/Down to recall previous submissions.
                     KeyCode::Up if !app.running => {
+                        last_esc = None;
                         app.history_up();
                     }
                     KeyCode::Down if !app.running => {
+                        last_esc = None;
                         app.history_down();
                     }
-                    KeyCode::Char(c) if !app.running => app.input.push(c),
+                    KeyCode::Char(c) if !app.running => {
+                        // If Esc was just pressed (without Enter), clear input first.
+                        if last_esc.take().is_some() {
+                            app.clear_input();
+                        }
+                        app.input.push(c)
+                    }
                     KeyCode::Backspace if !app.running => {
+                        if last_esc.take().is_some() {
+                            app.clear_input();
+                        }
                         app.input.pop();
                     }
                     _ => {}
@@ -401,8 +467,7 @@ async fn run(
                     MouseEventKind::Down(MouseButton::Left) => {
                         if app.overlay_active() {
                             let action = app.overlay_click(m.row);
-                            handle_overlay_action(action, app, &client, &ctl_tx, plugins);
-                        } else {
+                            handle_overlay_action(action, app, &client, &ctl_tx, plugins);                        } else {
                             log::debug!("mouse down row={}", m.row);
                             plugins.on_mouse_down(m.row, app);
                         }
@@ -451,6 +516,7 @@ fn to_overlay_key(code: KeyCode) -> Option<OverlayKey> {
         KeyCode::Up => Some(OverlayKey::Up),
         KeyCode::Down => Some(OverlayKey::Down),
         KeyCode::Backspace => Some(OverlayKey::Backspace),
+        KeyCode::Tab => Some(OverlayKey::Char('\t')),
         KeyCode::Char(c) => Some(OverlayKey::Char(c)),
         _ => None,
     }
@@ -467,23 +533,53 @@ fn handle_overlay_action(
     match action {
         OverlayAction::None => {}
         OverlayAction::FetchModels => {
-            let base = client.base_url().to_string();
-            let key = client.api_key().to_string();
             let tx = ctl_tx.clone();
+            let providers = app.all_providers.clone();
             tokio::spawn(async move {
-                let result = egg_agent::llm::openai::list_models(&base, &key)
-                    .await
-                    .map_err(|e| format!("{e:#}"));
+                let result = fetch_all_models(&providers).await;
                 let _ = tx.send(CtlEvent::ModelList(result));
             });
         }
         OverlayAction::ApplyModel(model) => {
-            // Switch the live client, update the UI, and persist to config.
-            client.set_model(&model);
-            app.apply_chosen_model(model.clone());
+            // The model string may be "model_name (provider_name)".
+            let (model_name, provider_name) = parse_model_choice(&model);
+            client.set_model(model_name);
+            app.apply_chosen_model(model_name.to_string());
+
+            // If a named provider was selected, switch credentials.
+            if let Some(prov) = provider_name {
+                // Match by display label: for "default" the label comes from
+                // provider_label(url); for named providers it's the name itself.
+                let found = app.all_providers.iter().find(|(n, _k, url)| {
+                    if *n == "default" {
+                        cli::provider_label(url) == prov
+                    } else {
+                        n == prov
+                    }
+                });
+                if let Some((_name, _key, url)) = found {
+                    client.set_provider(url, _key);
+                    app.provider = prov.to_string();
+                }
+            }
+
             if let Ok(mut cfg) = Config::load_file_or_default() {
-                cfg.model = model;
+                cfg.model = model_name.to_string();
                 let _ = cfg.save();
+            }
+        }
+        OverlayAction::ConnectProvider {
+            name,
+            api_key,
+            base_url,
+        } => {
+            let result = cli::handle_slash_command(
+                &format!("/connect {name} {api_key} {base_url}"),
+                app,
+            );
+            if let Some(msg) = result {
+                app.messages
+                    .push(Message::new(Role::System, msg));
             }
         }
         OverlayAction::PluginCommand(name) => {
@@ -493,6 +589,49 @@ fn handle_overlay_action(
             }
         }
     }
+}
+
+/// Fetch models from all configured providers, returning a combined list
+/// where each model is labeled with its provider: "model_name (provider)".
+async fn fetch_all_models(providers: &[(String, String, String)]) -> Result<Vec<String>, String> {
+    let mut all: Vec<String> = Vec::new();
+    let multi = providers.len() > 1;
+    for (name, key, url) in providers {
+        let label = if name == "default" {
+            cli::provider_label(url)
+        } else {
+            name.clone()
+        };
+        match egg_agent::llm::openai::list_models(url, key).await {
+            Ok(models) => {
+                for m in models {
+                    if multi {
+                        all.push(format!("{m} ({label})"));
+                    } else {
+                        all.push(m);
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("failed to fetch models from {label}: {e:#}");
+            }
+        }
+    }
+    if all.is_empty() {
+        Err("no models found from any provider".to_string())
+    } else {
+        Ok(all)
+    }
+}
+
+/// Parse a "model_name (provider_name)" string back to its parts.
+fn parse_model_choice(choice: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = choice.strip_suffix(')') {
+        if let Some((model, provider)) = rest.split_once(" (") {
+            return (model, Some(provider));
+        }
+    }
+    (choice, None)
 }
 
 /// Watch for termination signals and restore the terminal before the process
@@ -530,29 +669,5 @@ fn spawn_signal_watcher() {
                 std::process::exit(130);
             }
         });
-    }
-}
-
-/// Derive a short provider name from the base URL host, for the status line.
-fn provider_label(base_url: &str) -> String {
-    let host = base_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(base_url)
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .trim_start_matches("api.");
-    // Take the second-to-last label ("novita" from "novita.ai"), else the host.
-    let parts: Vec<&str> = host.split('.').collect();
-    let name = if parts.len() >= 2 {
-        parts[parts.len() - 2]
-    } else {
-        host
-    };
-    if name.is_empty() {
-        "local".to_string()
-    } else {
-        name.to_string()
     }
 }
