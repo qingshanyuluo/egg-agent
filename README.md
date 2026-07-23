@@ -2,27 +2,75 @@
 
 A terminal-based AI coding agent TUI written in Rust, inspired by [opencode](https://opencode.ai).
 
-## Status
+## Install
 
-Early scaffold — the TUI shell (message list + input box) works; no model backend is wired up yet.
+```sh
+curl -fsSL https://raw.githubusercontent.com/qingshanyuluo/egg-agent/main/install.sh | sh
+```
+
+Or download a binary from the [Releases](https://github.com/qingshanyuluo/egg-agent/releases) page.
+
+Supports:
+- macOS (Apple Silicon / Intel)
+- Linux (x86_64 / ARM64)
+
+## Setup
+
+```sh
+egg config
+```
+
+This interactively prompts for your API key, base URL, and model. Works with any OpenAI-compatible provider (OpenAI, DeepSeek, Kimi, GLM, Qwen, etc.).
+
+Or set environment variables:
+
+```sh
+export EGG_API_KEY="sk-..."
+export EGG_BASE_URL="https://api.deepseek.com/v1"
+export EGG_MODEL="deepseek-chat"
+```
+
+## Usage
+
+```sh
+egg                  # Start a new session
+egg --resume         # Resume a saved session (interactive pick)
+egg --resume <id>    # Resume by id (e.g. 20260723-1530)
+egg model            # Switch the active model
+```
+
+Keybindings in the TUI:
+
+- `Enter` — send message
+- `Shift+Enter` / `Alt+Enter` — newline in input
+- `Esc` — cancel running turn / clear input
+- `Ctrl+C` — clear input (first press) / quit (second press)
+- `Up/Down` — navigate input history
+- `PgUp/PgDn` — scroll transcript
+- `/` on empty input — command palette
+- Mouse — select/copy text, click reasoning to expand/collapse
 
 ## Features
 
-- [x] ratatui-based TUI: conversation view + input box
-- [ ] LLM provider integration
-- [ ] Tool calling (file edit, shell, ...)
-- [ ] Session persistence
+- [x] ratatui-based TUI with streaming conversation view
+- [x] LLM provider integration (OpenAI-compatible, with retry)
+- [x] Tool calling: bash, read_file, write_file, edit_file, search
+- [x] Session persistence (save/resume)
+- [x] Plugin system: translation, bash explanation, clipboard copy
+- [x] Model picker with live model list
+- [x] Interactive config wizard
+- [x] Streaming reasoning (chain-of-thought) with expand/collapse
 
-## Build & Run
+## Build from Source
 
 ```sh
-cargo run
+git clone https://github.com/qingshanyuluo/egg-agent.git
+cd egg-agent
+cargo build --release
 ```
-
-- `Enter` — send message
-- `Esc` / `Ctrl-C` — quit
 
 ## Stack
 
 - [ratatui](https://github.com/ratatui/ratatui) + [crossterm](https://github.com/crossterm-rs/crossterm) for the TUI
 - [tokio](https://tokio.rs) for async runtime
+- [reqwest](https://github.com/seanmonstar/reqwest) for HTTP/streaming
