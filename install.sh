@@ -3,7 +3,9 @@ set -e
 
 REPO="qingshanyuluo/egg-agent"
 BIN="egg"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+# Empty unless the user explicitly overrides. The install step below picks a
+# sensible default so `curl … | sh` works without sudo or a controlling TTY.
+INSTALL_DIR="${INSTALL_DIR:-}"
 
 # ---- detect platform ----
 OS=$(uname -s)
@@ -62,13 +64,51 @@ fi
 tar xzf egg.tar.gz
 
 # ---- install ----
-if [ -w "$INSTALL_DIR" ]; then
-  cp "$BIN" "$INSTALL_DIR/$BIN"
-else
-  echo "Need sudo to install to $INSTALL_DIR"
-  sudo cp "$BIN" "$INSTALL_DIR/$BIN"
-fi
-chmod +x "$INSTALL_DIR/$BIN"
+# Copy the binary into $1 (using sudo only if we have a real TTY to prompt on).
+# Returns non-zero if the dir isn't writable and we can't escalate — the caller
+# then falls back to a user-owned dir.
+install_bin() {
+  dir="$1"
+  if [ -w "$dir" ]; then
+    cp "$BIN" "$dir/$BIN" && chmod +x "$dir/$BIN"
+  elif command -v sudo >/dev/null 2>&1 && [ -t 0 ]; then
+    echo "Need sudo to install to $dir"
+    sudo cp "$BIN" "$dir/$BIN" && sudo chmod +x "$dir/$BIN"
+  else
+    return 1
+  fi
+}
 
-echo "egg-agent installed to $INSTALL_DIR/$BIN"
+if [ -n "$INSTALL_DIR" ]; then
+  # Explicit override — honor it, creating the dir if needed.
+  mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+  if ! install_bin "$INSTALL_DIR"; then
+    echo "Cannot write to $INSTALL_DIR (and no interactive sudo available)." >&2
+    exit 1
+  fi
+  DEST="$INSTALL_DIR"
+elif [ -w /usr/local/bin ] && install_bin /usr/local/bin; then
+  # System dir already writable (e.g. Homebrew-owned, or running as root).
+  DEST="/usr/local/bin"
+else
+  # Default: a user-owned dir that needs no sudo. Works under `curl | sh`.
+  DEST="$HOME/.local/bin"
+  mkdir -p "$DEST"
+  if ! install_bin "$DEST"; then
+    echo "Failed to install to $DEST" >&2
+    exit 1
+  fi
+fi
+
+echo "egg-agent installed to $DEST/$BIN"
+
+# Nudge the user if the install dir isn't on PATH — otherwise `egg` won't be found.
+case ":$PATH:" in
+  *":$DEST:"*) ;;
+  *)
+    echo "⚠  $DEST is not on your PATH. Add it, then restart your shell:"
+    echo "     echo 'export PATH=\"$DEST:\$PATH\"' >> ~/.zshrc"
+    ;;
+esac
+
 echo "Run 'egg' to start, then /connect to add your API provider."
