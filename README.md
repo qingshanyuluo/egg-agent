@@ -16,11 +16,17 @@ Supports:
 
 ## Setup
 
+Start the TUI and connect your API provider:
+
 ```sh
-egg config
+egg                   # Launch the TUI
 ```
 
-This interactively prompts for your API key, base URL, and model. Works with any OpenAI-compatible provider (OpenAI, DeepSeek, Kimi, GLM, Qwen, etc.).
+Then type `/connect` and follow the wizard, or pass credentials directly:
+
+```
+/connect deepseek sk-xxxxxxxx https://api.deepseek.com/v1
+```
 
 Or set environment variables:
 
@@ -36,8 +42,14 @@ export EGG_MODEL="deepseek-chat"
 egg                  # Start a new session
 egg --resume         # Resume a saved session (interactive pick)
 egg --resume <id>    # Resume by id (e.g. 20260723-1530)
-egg model            # Switch the active model
 ```
+
+Slash commands inside the TUI:
+
+- `/model` — open the model picker (fetches live model list from all connected providers)
+- `/connect` — open the connect-wizard to add a provider
+- `/connect <name> <api_key> [base_url]` — connect a provider directly
+- `/connect-remove <name>` — remove a named provider
 
 Keybindings in the TUI:
 
