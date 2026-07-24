@@ -49,4 +49,4 @@ fi
 chmod +x "$INSTALL_DIR/$BIN"
 
 echo "egg-agent installed to $INSTALL_DIR/$BIN"
-echo "Run 'egg config' to set your API key."
+echo "Run 'egg' to start, then /connect to add your API provider."
