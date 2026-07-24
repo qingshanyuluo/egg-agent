@@ -445,13 +445,14 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
                     }
                 }
                 Role::ToolOutput => {
-                    if message.output_collapsed && message.full_content.is_some() {
-                        // Collapsed with full content available: skip preview entirely,
-                        // will render a one-line summary below.
+                    if message.full_content.is_some() {
+                        // Full content available: the dedicated ToolOutput block
+                        // below renders it (collapsed summary or expanded body).
+                        // Skip the `content` preview here to avoid rendering the
+                        // truncated preview *and* the full output twice.
                         continue;
                     } else {
-                        // Either expanded (showing full content) or short output
-                        // (no full_content): render normally.
+                        // Short output with no full_content: render normally.
                         tool_output_line(text)
                     }
                 }
