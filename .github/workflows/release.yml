@@ -5,6 +5,12 @@ on:
     tags:
       - "v*"
 
+# action-gh-release needs write access to create the release and upload
+# assets. Without this the default GITHUB_TOKEN is read-only and the upload
+# step fails with "403 Resource not accessible by integration".
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build (${{ matrix.target }})
