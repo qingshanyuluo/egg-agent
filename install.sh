@@ -29,11 +29,33 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 cd "$TMPDIR"
 if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$RELEASE_URL" -o egg.tar.gz
+  # --connect-timeout bounds the initial handshake so a black-holed network
+  # fails fast instead of hanging; --retry with backoff rides out transient
+  # blips (flaky wifi, 5xx from the CDN). --retry-all-errors so connection
+  # failures (not just HTTP codes) are retried too. --fail keeps a 404 from
+  # being written to disk as a "success".
+  if ! curl -fsSL \
+        --connect-timeout 10 \
+        --retry 3 --retry-delay 2 --retry-all-errors \
+        "$RELEASE_URL" -o egg.tar.gz; then
+    echo "Download failed: $RELEASE_URL" >&2
+    echo "Check your network, or see https://github.com/$REPO/releases for manual install." >&2
+    exit 1
+  fi
 elif command -v wget >/dev/null 2>&1; then
-  wget -q "$RELEASE_URL" -O egg.tar.gz
+  if ! wget --timeout=10 --tries=3 --waitretry=2 -q "$RELEASE_URL" -O egg.tar.gz; then
+    echo "Download failed: $RELEASE_URL" >&2
+    echo "Check your network, or see https://github.com/$REPO/releases for manual install." >&2
+    exit 1
+  fi
 else
   echo "neither curl nor wget found" >&2
+  exit 1
+fi
+
+# Guard against a truncated / empty download slipping through.
+if [ ! -s egg.tar.gz ]; then
+  echo "Downloaded archive is empty — aborting." >&2
   exit 1
 fi
 

@@ -13,6 +13,27 @@ use crate::config::Config;
 
 use super::{ChatMessage, FunctionCall, LlmClient, StreamEvent, ToolCall, ToolDef};
 
+/// A streaming request went silent for longer than the per-chunk idle window.
+///
+/// Carried as a typed error (rather than a magic substring in the message) so
+/// the retry loop can classify a stall precisely with `downcast_ref` — resilient
+/// to any future rewording of the human-readable text.
+#[derive(Debug)]
+struct StreamStall {
+    /// Which phase stalled, for the log/UI message.
+    phase: &'static str,
+    /// The idle window that elapsed, in seconds.
+    secs: u64,
+}
+
+impl std::fmt::Display for StreamStall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} stalled — no data for {} s", self.phase, self.secs)
+    }
+}
+
+impl std::error::Error for StreamStall {}
+
 pub struct OpenAiClient {
     http: reqwest::Client,
     /// Shared so `/model` (and provider switching) can change credentials
@@ -25,14 +46,22 @@ pub struct OpenAiClient {
 impl OpenAiClient {
     /// 10 s to establish the TCP+TLS connection.
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-    /// 2 min hard cap on a single HTTP request (streaming + tool calls).
-    const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+    /// Hard cap on a single HTTP request. A long reasoning turn (thinking +
+    /// hundreds of tokens + tool calls) can legitimately run for minutes, so
+    /// this is intentionally high — the real liveness guardrail is the per-chunk
+    /// idle timeout below, not this coarse total cap.
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
     /// If no chunk arrives within this window the stream is considered dead.
-    /// More lenient for the first chunk (TTFT can be 5-15 s for large models);
-    /// aggressive for subsequent chunks (a healthy stream pushes tokens every
-    /// few hundred ms — a 5 s gap means the connection is stalled).
-    const FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
-    const NEXT_CHUNK_TIMEOUT: Duration = Duration::from_secs(5);
+    /// More lenient for the first chunk (TTFT can be 5-15 s for large models).
+    ///
+    /// The per-chunk window is deliberately generous (60 s): reasoning models
+    /// (o1 / DeepSeek-R1 / QwQ) can think for tens of seconds between visible
+    /// tokens, and mobile / cross-border links jitter enough that an occasional
+    /// multi-second gap is normal, not a dead connection. A 5 s window — which
+    /// this used to be — false-killed all of those. 60 s still catches a truly
+    /// hung socket, and the outer retry loop re-issues the request when it fires.
+    const FIRST_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
+    const NEXT_CHUNK_TIMEOUT: Duration = Duration::from_secs(60);
 
     fn build_http() -> reqwest::Client {
         reqwest::Client::builder()
@@ -102,7 +131,7 @@ pub async fn list_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 0..=2 {
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(400 * (1 << (attempt - 1)))).await;
+            tokio::time::sleep(backoff_delay(attempt)).await;
         }
         match fetch_models_once(&client, &url, api_key).await {
             Ok(ids) => return Ok(ids),
@@ -305,10 +334,11 @@ impl Accumulator {
 
 #[async_trait]
 impl LlmClient for OpenAiClient {
-    /// Stream one chat completion. Retries on pre-stream errors (connection
-    /// refused, 5xx, 429) but NOT on in-stream stalls — a stalled stream means
-    /// the server accepted the request and then stopped producing; retrying the
-    /// same request would just hit the same slow/broken generation path.
+    /// Stream one chat completion. Retries on transient failures — pre-stream
+    /// errors (connection refused, 5xx, 429) and in-stream stalls alike. With a
+    /// generous 60 s idle window a stall means the socket is genuinely dead, so
+    /// re-issuing the request is the right recovery (the previous version gave up
+    /// on any stall, which stranded users behind a single network blip).
     async fn chat_stream(
         &self,
         messages: &[ChatMessage],
@@ -319,7 +349,7 @@ impl LlmClient for OpenAiClient {
 
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                let delay = Duration::from_millis(400 * (1 << (attempt - 1)));
+                let delay = backoff_delay(attempt);
                 // Let the UI show what's happening.
                 let _ = events.send(StreamEvent::Content(format!(
                     "\n\n[⟳ retry {attempt}/{MAX_RETRIES} in {}ms…]\n",
@@ -336,12 +366,6 @@ impl LlmClient for OpenAiClient {
                     return Ok(msg);
                 }
                 Err(e) => {
-                    let is_stall = format!("{e:#}").to_lowercase().contains("stalled");
-                    if is_stall {
-                        // In-stream stall — retrying won't help.
-                        log::warn!("llm: stream stalled, not retrying: {e:#}");
-                        return Err(e);
-                    }
                     if !is_retryable(&e) {
                         return Err(e);
                     }
@@ -418,8 +442,12 @@ impl OpenAiClient {
                 }
                 Ok(None) => break,
                 Err(_elapsed) => {
-                    let label = if first_chunk { "first token" } else { "stream" };
-                    bail!("{label} stalled — no data for {} s", deadline.as_secs());
+                    let phase = if first_chunk { "first token" } else { "stream" };
+                    return Err(StreamStall {
+                        phase,
+                        secs: deadline.as_secs(),
+                    }
+                    .into());
                 }
             };
 
@@ -470,14 +498,18 @@ impl OpenAiClient {
     }
 }
 
-/// Whether an error is worth retrying. Retries on timeouts, connection issues,
-/// server errors (5xx), rate limits (429), and unexpected stream termination.
-/// Does NOT retry on client errors (4xx = bad key / bad request).
+/// Whether an error is worth retrying. Retries on stalls (typed), timeouts,
+/// connection issues, server errors (5xx), rate limits (429), and unexpected
+/// stream termination. Does NOT retry on client errors (4xx = bad key / bad
+/// request).
 fn is_retryable(e: &anyhow::Error) -> bool {
+    // Typed stall — classified precisely, not by substring.
+    if e.downcast_ref::<StreamStall>().is_some() {
+        return true;
+    }
     let s = format!("{e:#}").to_lowercase();
     s.contains("timed out")
         || s.contains("timeout")
-        || s.contains("stalled")       // per-chunk stall detection
         || s.contains("connection")
         || s.contains("500 ")
         || s.contains("502 ")
@@ -490,4 +522,76 @@ fn is_retryable(e: &anyhow::Error) -> bool {
         || s.contains("unexpected")
         || s.contains("stream closed")
         || s.contains("incomplete")
+}
+
+/// Exponential backoff with full jitter for retry attempt `n` (1-based).
+///
+/// Base grows `400ms · 2^(n-1)` (400 / 800 / 1600 …). "Full jitter" then picks a
+/// uniform delay in `[base/2, base]` so many clients retrying after the same
+/// outage don't reconnect in lockstep (thundering herd). Capped at 30 s.
+fn backoff_delay(attempt: usize) -> Duration {
+    let base_ms = (400u64 * (1u64 << (attempt.saturating_sub(1) as u32))).min(30_000);
+    let half = base_ms / 2;
+    // Cheap, dependency-free jitter: hash a fresh RandomState (seeded from OS
+    // entropy per construction) to get a well-distributed value, then map it
+    // into [0, half]. No external rng crate, no reliance on wall-clock.
+    use std::hash::{BuildHasher, Hasher};
+    let noise = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let jitter = if half == 0 { 0 } else { noise % (half + 1) };
+    Duration::from_millis(half + jitter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_full_jitter_stays_in_band() {
+        // For each attempt, base = 400·2^(n-1); full jitter => delay ∈ [base/2, base].
+        for attempt in 1..=6usize {
+            let base = (400u64 * (1u64 << (attempt - 1))).min(30_000);
+            let lo = base / 2;
+            let hi = base;
+            // Sample repeatedly: the RandomState seed differs per call, so this
+            // exercises the jitter distribution, not a single fixed value.
+            for _ in 0..200 {
+                let d = backoff_delay(attempt).as_millis() as u64;
+                assert!(
+                    d >= lo && d <= hi,
+                    "attempt {attempt}: delay {d}ms outside [{lo},{hi}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backoff_is_capped() {
+        // Very large attempt must not overflow or exceed the 30 s cap.
+        let d = backoff_delay(20).as_millis() as u64;
+        assert!(d <= 30_000, "delay {d}ms exceeds 30s cap");
+    }
+
+    #[test]
+    fn typed_stall_is_retryable() {
+        let e: anyhow::Error = StreamStall { phase: "stream", secs: 60 }.into();
+        assert!(is_retryable(&e), "a stall must be retryable");
+        // And it still renders a helpful message.
+        assert!(format!("{e:#}").contains("stalled"));
+    }
+
+    #[test]
+    fn client_error_not_retryable() {
+        let e = anyhow::anyhow!("LLM API returned 401 Unauthorized: bad key");
+        assert!(!is_retryable(&e), "4xx auth errors must not retry");
+    }
+
+    #[test]
+    fn server_error_is_retryable() {
+        for code in ["500 ", "502 ", "503 ", "504 ", "429"] {
+            let e = anyhow::anyhow!("LLM API returned {code} something");
+            assert!(is_retryable(&e), "{code} should retry");
+        }
+    }
 }
