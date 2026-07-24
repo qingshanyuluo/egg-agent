@@ -1,6 +1,6 @@
 [package]
 name = "egg-agent"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 
 [[bin]]
@@ -10,7 +10,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 crossterm = "0.29"
-ratatui = "0.30"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, which the UI
+# uses as the single source of truth for wrapped-line height (see src/ui.rs
+# `wrapped_height`). Pinned to a minor range because it's an unstable API.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 serde = { version = "1", features = ["derive"] }

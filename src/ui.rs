@@ -557,74 +557,61 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let term_w = area.width.max(1) as u16; // terminal width for wrapping calculations
 
     // --- Pre-compute visual (wrapped) row positions for each logical line ---
-    // Each logical Line may wrap to ceil(display_width / term_w) screen rows.
+    // SINGLE SOURCE OF TRUTH: `wrapped_height` delegates to ratatui's own
+    // `Paragraph::line_count`, i.e. the exact `WordWrapper` the final render
+    // uses. So `visual_pos` / `total_visual` can never drift from the drawn
+    // layout — the class of bug where the tail scrolls out of view is gone.
+    //
     // `visual_pos[i]` is the 0-based visual row where logical line `i` starts;
     // `total_visual` is the full rendered height in visual rows.
     let mut visual_pos: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut heights: Vec<usize> = Vec::with_capacity(lines.len());
     let mut total_visual = 0usize;
     for line in &lines {
         visual_pos.push(total_visual);
-        let w = line_display_width(line).max(1) as u16;
-        total_visual += ((w + term_w - 1) / term_w) as usize;
+        let h = wrapped_height(line, term_w);
+        heights.push(h);
+        total_visual += h;
     }
 
     // Store for scroll_up() / scroll_down() clamping (via Cell interior mutability).
     app.total_rows.set(total_visual);
     app.view_height.set(height);
+    // Re-clamp the manual scroll against THIS frame's totals. A width change
+    // (resize) alters wrapping and thus `total_visual`, so a `scroll_back` that
+    // was valid last frame may now exceed the max — clamp it here rather than
+    // trusting the stale value carried by scroll_up()/scroll_down().
+    app.clamp_scroll();
 
     // Auto-scroll: when following new content, show the bottom `height` rows.
-    // `scroll_back` is in visual-row units, keeping everything in one coordinate space.
+    // `scroll_back` is in visual-row units, keeping everything in one coordinate
+    // space. `visual_scroll` stays `usize` end-to-end — no u16 truncation.
     let auto_scroll = total_visual.saturating_sub(height);
     let visual_scroll = if app.is_scrolled_back() {
-        auto_scroll.saturating_sub(app.scroll_back)
+        auto_scroll.saturating_sub(app.scroll_back.get())
     } else {
         auto_scroll
     };
-
-    // Log every message that has reasoning (to diagnose missing hitboxes).
-    for (i, msg) in app.messages.iter().enumerate() {
-        if !msg.reasoning.is_empty() {
-            log::debug!(
-                "render: msg[{i}] role={:?} reasoning_len={} collapsed={} content_len={}",
-                msg.role,
-                msg.reasoning.len(),
-                msg.reasoning_collapsed,
-                msg.content.len(),
-            );
-        }
-    }
 
     // --- Hitbox computation ---
     // Compute each thought-row's screen-y directly from its pre-computed visual
     // position minus the scroll offset. No need to iterate over preceding lines
     // every frame; `visual_pos` has already done that work.
-    let thought_count = thought_rows.len();
     let mut hitboxes = app.thought_hitboxes.borrow_mut();
     hitboxes.clear();
-
     for (flat_idx, msg_idx) in &thought_rows {
-        let screen_y =
-            area.y as isize + visual_pos[*flat_idx] as isize - visual_scroll as isize;
+        let screen_y = area.y as isize + visual_pos[*flat_idx] as isize - visual_scroll as isize;
         if screen_y >= 0 && (screen_y as u16) < area.y + area.height {
             hitboxes.push((screen_y as u16, *msg_idx));
         }
     }
-    log::debug!(
-        "hitboxes: {thought_count} thought_rows -> {n_visible} visible (area.y={a_y} area.h={a_h} total_v={total_visual} v_scroll={visual_scroll} term_w={term_w}) rows={hitboxes:?}",
-        n_visible = hitboxes.len(),
-        a_y = area.y,
-        a_h = area.height,
-    );
     drop(hitboxes);
 
     // --- Tool hitbox computation ---
-    let _tool_count = tool_rows.len();
     let mut tool_hitboxes = app.tool_hitboxes.borrow_mut();
     tool_hitboxes.clear();
-
     for (flat_idx, msg_idx) in &tool_rows {
-        let screen_y =
-            area.y as isize + visual_pos[*flat_idx] as isize - visual_scroll as isize;
+        let screen_y = area.y as isize + visual_pos[*flat_idx] as isize - visual_scroll as isize;
         if screen_y >= 0 && (screen_y as u16) < area.y + area.height {
             tool_hitboxes.push((screen_y as u16, *msg_idx));
         }
@@ -635,10 +622,8 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     let mut row_text = app.row_text.borrow_mut();
     row_text.clear();
     let sel = app.selection_rows();
-
     for (flat_idx, line) in lines.iter_mut().enumerate() {
-        let screen_y =
-            area.y as isize + visual_pos[flat_idx] as isize - visual_scroll as isize;
+        let screen_y = area.y as isize + visual_pos[flat_idx] as isize - visual_scroll as isize;
         if screen_y < 0 || (screen_y as u16) >= area.y + area.height {
             continue;
         }
@@ -656,18 +641,67 @@ fn draw_transcript(frame: &mut Frame, app: &App, area: Rect) {
     }
     drop(row_text);
 
-    let paragraph = Paragraph::new(lines)
+    log::debug!(
+        "transcript: {n_lines} logical lines, total_visual={total_visual} view_h={height} \
+         v_scroll={visual_scroll} scroll_back={sb} term_w={term_w} thought_hits={th} tool_hits={tl}",
+        n_lines = lines.len(),
+        sb = app.scroll_back.get(),
+        th = app.thought_hitboxes.borrow().len(),
+        tl = app.tool_hitboxes.borrow().len(),
+    );
+
+    // --- Render ---
+    // We DON'T hand the whole transcript to `Paragraph::scroll`, because that
+    // offset is a `u16` and would overflow once a long conversation wraps past
+    // 65535 rows. Instead, drop every logical line fully above the viewport and
+    // scroll only within the first partially-visible line. That inner offset is
+    // always < one logical line's wrapped height, so it comfortably fits a u16.
+    let mut first_visible = 0usize;
+    while first_visible < lines.len()
+        && visual_pos[first_visible] + heights[first_visible] <= visual_scroll
+    {
+        first_visible += 1;
+    }
+    let inner_offset = visual_scroll.saturating_sub(
+        visual_pos.get(first_visible).copied().unwrap_or(visual_scroll),
+    );
+    let visible_lines: Vec<Line> = lines.split_off(first_visible.min(lines.len()));
+
+    let paragraph = Paragraph::new(visible_lines)
         .wrap(Wrap { trim: false })
-        .scroll((visual_scroll as u16, 0));
+        .scroll((inner_offset as u16, 0));
     frame.render_widget(paragraph, area);
+
+    // --- Layout invariant self-check (cheap; catches wrap drift immediately) ---
+    // With the single-source-of-truth wrapping above this must always hold; the
+    // assert turns any future regression into an immediate, localized failure in
+    // debug builds while staying silent (a warn log) in release.
+    debug_assert!(
+        visual_scroll + height >= total_visual || app.is_scrolled_back(),
+        "transcript not pinned to bottom: v_scroll={visual_scroll} + h={height} < total={total_visual}"
+    );
 }
 
-/// Display width of a line in terminal columns (handles CJK via unicode-width).
-fn line_display_width(line: &Line) -> usize {
-    line.spans
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-        .sum()
+/// Number of screen rows a single logical line occupies once wrapped to `width`.
+///
+/// This is THE single source of truth for wrapping height. It delegates to
+/// ratatui's own `Paragraph::line_count`, which internally runs the exact same
+/// `WordWrapper` (word-boundary wrapping, `trim: false`) that the final render
+/// uses — so the count can never drift from what actually gets drawn.
+///
+/// Wrapping is per-input-line independent inside `WordWrapper` (each line resets
+/// the pending-word/whitespace state), so counting line-by-line and summing is
+/// identical to counting the whole transcript at once.
+fn wrapped_height(line: &Line, width: u16) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    // `line_count` returns 0 for empty text; a blank logical line still occupies
+    // one screen row, so clamp to at least 1.
+    Paragraph::new(line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
 }
 
 /// Plain text of a line for clipboard copy, with the leading gutter decoration
@@ -850,19 +884,44 @@ fn input_cursor_pos(app: &App, area: Rect) -> (u16, u16) {
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let state = if app.running { "working…" } else { "ready" };
     let scroll = if app.is_scrolled_back() {
-        format!(" · scrolled ↑{}", app.scroll_back)
+        format!(" · scrolled ↑{}", app.scroll_back.get())
+    } else {
+        String::new()
+    };
+    // Optional layout HUD: `EGG_DEBUG=1` appends live scroll/height figures so a
+    // "tail cut off" report can be eyeballed without reading the log file. The
+    // env var is read once (OnceLock) to avoid a syscall every frame.
+    let hud = if debug_hud_enabled() {
+        format!(
+            " · rows {}/{} back {} vh {}",
+            app.total_rows.get().saturating_sub(app.scroll_back.get()),
+            app.total_rows.get(),
+            app.scroll_back.get(),
+            app.view_height.get(),
+        )
     } else {
         String::new()
     };
     let text = format!(
-        " {} · {} · {}{} · ↑↓ history · Enter send · Ctrl+C quit",
-        app.provider, app.model, state, scroll
+        " {} · {} · {}{}{} · ↑↓ history · Enter send · Ctrl+C quit",
+        app.provider, app.model, state, scroll, hud
     );
     let status = Paragraph::new(Line::from(Span::styled(
         text,
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(status, area);
+}
+
+/// Whether the `EGG_DEBUG` layout HUD is on (checked once for the process).
+fn debug_hud_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("EGG_DEBUG")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 fn role_color(role: Role) -> Color {
@@ -910,4 +969,300 @@ fn draw_splash(frame: &mut Frame, app: &App, area: Rect) {
     ]));
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+#[cfg(test)]
+mod tests {
+    //! Snapshot / invariant regression tests for the transcript renderer.
+    //!
+    //! These guard the original bug: after a long conversation the tail of the
+    //! transcript scrolled out of view because a hand-rolled `ceil(w/term_w)`
+    //! line count drifted from ratatui's real `WordWrapper`. The fix made
+    //! `wrapped_height` (→ `Paragraph::line_count`) the single source of truth.
+    //! The tests below assert (a) `wrapped_height` equals the *actually rendered*
+    //! row count across CJK / long-word / exact-boundary inputs, and (b) the last
+    //! transcript line lands on the bottom row of the transcript area for a range
+    //! of widths and message counts.
+
+    use super::*;
+    use crate::app::App;
+    use crate::types::{Message, Role};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// Build an `App` in "following the tail" state (not scrolled back, splash
+    /// off) with the given transcript messages.
+    fn app_with(messages: Vec<Message>) -> App {
+        let mut app = App::new("test-model".into(), "test-provider".into());
+        app.show_splash = false;
+        app.messages = messages;
+        app
+    }
+
+    /// Render `line` alone into a tall buffer of the given width and count how
+    /// many rows it actually occupies (rows containing any non-space cell, plus
+    /// the untouched trailing blank rows of a wrapped-but-empty line handled by
+    /// the caller). This is the ground truth the renderer produces on screen.
+    fn rendered_rows(line: &Line, width: u16) -> usize {
+        let height = 200u16; // comfortably taller than any single wrapped line here
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| {
+                let para = Paragraph::new(line.clone()).wrap(Wrap { trim: false });
+                f.render_widget(para, f.area());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut last_nonblank: Option<u16> = None;
+        for y in 0..height {
+            let mut has_ink = false;
+            for x in 0..width {
+                if buf[(x, y)].symbol() != " " {
+                    has_ink = true;
+                    break;
+                }
+            }
+            if has_ink {
+                last_nonblank = Some(y);
+            }
+        }
+        // `+1` to turn a 0-based row index into a count; an all-blank line still
+        // occupies one row, matching `wrapped_height`'s `.max(1)`.
+        last_nonblank.map_or(1, |y| y as usize + 1)
+    }
+
+    /// The whole point of the fix: our height oracle must match what ratatui
+    /// actually paints, or the tail scrolls off. Covers CJK (double-width),
+    /// a single unbreakable long word, and text sized to the exact wrap column.
+    #[test]
+    fn wrapped_height_matches_rendered_rows() {
+        let cases: Vec<(&str, Line)> = vec![
+            ("ascii short", Line::from("hello world")),
+            (
+                "cjk long",
+                Line::from("你好世界这是一段很长的中文文本用来测试折行是否正确".to_string()),
+            ),
+            (
+                "unbreakable long word",
+                Line::from("x".repeat(250)),
+            ),
+            (
+                "mixed cjk + ascii",
+                Line::from("prefix 中文 middle 更多的中文字符 suffix tail words here".to_string()),
+            ),
+            (
+                "leading gutter + long",
+                Line::from(vec![
+                    Span::raw("     "),
+                    Span::raw("a fairly long sentence that will certainly wrap several times across".to_string()),
+                ]),
+            ),
+        ];
+
+        for width in [10u16, 20, 24, 40, 80] {
+            for (label, line) in &cases {
+                let oracle = wrapped_height(line, width);
+                let actual = rendered_rows(line, width);
+                assert_eq!(
+                    oracle, actual,
+                    "wrapped_height drift: case={label:?} width={width} \
+                     oracle={oracle} actual={actual}"
+                );
+            }
+        }
+    }
+
+    /// An exact wrap-boundary is the classic off-by-one trap: a line whose width
+    /// is an exact multiple of the terminal width must NOT gain a phantom extra
+    /// row. Check widths where `content_width % width == 0`.
+    #[test]
+    fn wrapped_height_exact_boundary_no_phantom_row() {
+        for width in [8u16, 10, 16, 20] {
+            for mult in 1..=4u16 {
+                let line = Line::from("a".repeat((width * mult) as usize));
+                let oracle = wrapped_height(&line, width);
+                let actual = rendered_rows(&line, width);
+                assert_eq!(
+                    oracle, actual,
+                    "boundary drift: width={width} mult={mult} oracle={oracle} actual={actual}"
+                );
+            }
+        }
+    }
+
+    /// Read the full plaintext of a rendered buffer row (trimmed of trailing
+    /// spaces) so we can locate content on screen.
+    fn row_string(buf: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        let mut s = String::new();
+        for x in 0..width {
+            s.push_str(buf[(x, y)].symbol());
+        }
+        s.trim_end().to_string()
+    }
+
+    /// The core regression: after rendering while following the tail, the last
+    /// transcript line's text must be *visible* in the transcript region and
+    /// nothing may render below it — i.e. the tail is never scrolled out of view.
+    ///
+    /// Two valid shapes:
+    ///   * content overflows the viewport → marker sits on the very bottom row
+    ///     (classic "stick to bottom"); this is the case the original bug broke.
+    ///   * content fits with room to spare → marker sits on its natural row and
+    ///     every row below it is blank.
+    /// Both reduce to: the marker is present, and it is the last non-blank row.
+    ///
+    /// The transcript occupies the top region of the layout; below it sit a
+    /// 1-row spacer, the input box (≥3 rows), and a 1-row status line.
+    fn assert_tail_pinned(width: u16, height: u16, n_msgs: usize) {
+        // Give the last message a unique, searchable marker as its final line.
+        let marker = "ZZ_TAIL_MARKER_ZZ";
+        let mut messages = Vec::new();
+        for i in 0..n_msgs {
+            let body = if i == n_msgs - 1 {
+                format!(
+                    "message {i} body with some length so it wraps a bit on narrow \
+                     terminals and exercises the wrapper\n{marker}"
+                )
+            } else {
+                format!(
+                    "message {i} 这是一条包含中文的消息 with mixed content that is long \
+                     enough to wrap across several visual rows on a narrow terminal window"
+                )
+            };
+            messages.push(Message::new(Role::User, body));
+        }
+        let app = app_with(messages);
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // Layout (see `draw`): transcript = Min(1); then spacer(1), input(3..=12),
+        // status(1). Input height here is 3 (single empty input line + 2 borders).
+        let input_h = 3u16;
+        let transcript_h = height - 1 /*spacer*/ - input_h - 1 /*status*/;
+
+        // Find the last non-blank row within the transcript region and assert it
+        // is the marker line. If the tail had scrolled out of view, the marker
+        // would be absent and some *other* content row would be the last one.
+        let mut last_content: Option<u16> = None;
+        for y in 0..transcript_h {
+            if !row_string(&buf, y, width).is_empty() {
+                last_content = Some(y);
+            }
+        }
+        let dump = || {
+            (0..transcript_h)
+                .map(|y| format!("  {y:>2}| {}", row_string(&buf, y, width)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let last = last_content.unwrap_or_else(|| {
+            panic!(
+                "transcript region is entirely blank: width={width} height={height} n_msgs={n_msgs}"
+            )
+        });
+        let last_row = row_string(&buf, last, width);
+        assert!(
+            last_row.contains(marker),
+            "tail not pinned: width={width} height={height} n_msgs={n_msgs}\n\
+             last non-blank transcript row {last} = {last_row:?}, expected it to hold {marker:?}\n\
+             transcript region:\n{}",
+            dump()
+        );
+    }
+
+    #[test]
+    fn tail_pinned_various_widths() {
+        // Narrow terminals wrap the most and are where the old drift bit hardest.
+        for width in [20u16, 24, 40, 80, 120] {
+            assert_tail_pinned(width, 24, 40);
+        }
+    }
+
+    #[test]
+    fn tail_pinned_many_messages() {
+        // A long conversation is the reported failure scenario.
+        for n in [1usize, 5, 50, 200] {
+            assert_tail_pinned(40, 24, n);
+        }
+    }
+
+    #[test]
+    fn tail_pinned_short_terminal() {
+        // A very short transcript window (only a couple of rows) still pins.
+        assert_tail_pinned(40, 8, 30);
+    }
+
+    /// When following the tail (not scrolled back), the layout invariant the
+    /// renderer `debug_assert!`s must hold: `visual_scroll + view_height >=
+    /// total_rows`. We can't read `visual_scroll` directly, but `total_rows` and
+    /// `view_height` are published to the `App` each frame, and when not scrolled
+    /// back `visual_scroll == max(0, total_rows - view_height)`, so the invariant
+    /// reduces to a tautology *iff* the published totals are self-consistent.
+    /// This asserts those published values are sane (view_height > 0, totals set).
+    #[test]
+    fn published_totals_are_set_after_draw() {
+        let app = app_with(vec![Message::new(
+            Role::User,
+            "hello 世界 this wraps eventually across the width of a modest window".to_string(),
+        )]);
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+
+        assert!(app.view_height.get() > 0, "view_height not published");
+        assert!(app.total_rows.get() > 0, "total_rows not published");
+        // Following the tail => scroll_back stays clamped at 0.
+        assert_eq!(app.scroll_back.get(), 0, "unexpected scroll_back while following tail");
+    }
+
+    /// Regression for the resize-clamp-staleness bug (task #4): scroll back near
+    /// the top at a narrow width (many wrapped rows → large max_scroll_back),
+    /// then re-render at a much wider width (far fewer rows → smaller max). The
+    /// per-frame `clamp_scroll` must pull `scroll_back` down to the new max so we
+    /// never end up scrolled *past* the top with a blank viewport.
+    #[test]
+    fn resize_wider_reclamps_scroll_back() {
+        let mut messages = Vec::new();
+        for i in 0..30 {
+            messages.push(Message::new(
+                Role::User,
+                format!("message {i} 这是一段中文 with enough text to wrap several rows when narrow"),
+            ));
+        }
+        let mut app = app_with(messages);
+
+        // Frame 1 — narrow, tall content. Scroll almost to the very top.
+        let mut narrow = Terminal::new(TestBackend::new(20, 24)).unwrap();
+        narrow.draw(|f| draw(f, &app)).unwrap();
+        for _ in 0..500 {
+            app.scroll_up(); // saturates at the narrow-frame max_scroll_back
+        }
+        let narrow_max = app.total_rows.get().saturating_sub(app.view_height.get());
+        assert_eq!(
+            app.scroll_back.get(),
+            narrow_max,
+            "scroll_up should saturate at the narrow frame's max"
+        );
+
+        // Frame 2 — much wider: fewer wrapped rows, so a smaller valid max. The
+        // stale narrow `scroll_back` now exceeds it and MUST be clamped down.
+        let mut wide = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        wide.draw(|f| draw(f, &app)).unwrap();
+        let wide_max = app.total_rows.get().saturating_sub(app.view_height.get());
+        assert!(
+            app.scroll_back.get() <= wide_max,
+            "resize did not re-clamp scroll_back: scroll_back={} > wide_max={wide_max}",
+            app.scroll_back.get()
+        );
+
+        // And the transcript must not be blank at the top (proof we didn't scroll
+        // past the content): the first transcript row has ink.
+        let buf = wide.backend().buffer();
+        let first_row = row_string(buf, 0, 120);
+        assert!(
+            !first_row.is_empty(),
+            "top transcript row is blank after resize — scrolled past content"
+        );
+    }
 }

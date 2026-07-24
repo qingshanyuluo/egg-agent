@@ -81,7 +81,9 @@ pub struct App {
     /// Slash commands contributed by plugins, refreshed at startup.
     pub plugin_commands: Vec<SlashCommand>,
     /// Manual scroll offset from bottom: 0 = auto-follow, >0 = scrolled up.
-    pub scroll_back: usize,
+    /// A `Cell` so the UI can re-clamp it against the freshly measured layout
+    /// each frame (via `clamp_scroll`) without needing `&mut App`.
+    pub scroll_back: std::cell::Cell<usize>,
     /// Handle to abort a running agent task (Esc during a turn).
     pub abort_handle: Option<tokio::task::AbortHandle>,
     /// When the last Ctrl+C was pressed (for two-stage quit).
@@ -125,7 +127,7 @@ impl App {
             selection: None,
             copied_at: None,
             plugin_commands: Vec::new(),
-            scroll_back: 0,
+            scroll_back: std::cell::Cell::new(0),
             abort_handle: None,
             last_ctrl_c: None,
             input_history: Vec::new(),
@@ -168,7 +170,7 @@ impl App {
                 self.wait_started = Some(Instant::now());
                 self.reasoning_started = None;
                 self.streaming_idx = None;
-                self.scroll_back = 0;
+                self.scroll_back.set(0);
                 // Auto-collapse all tool outputs from previous turns (like reasoning).
                 for msg in &mut self.messages {
                     if msg.role == Role::ToolOutput && msg.full_content.is_some() {
@@ -310,20 +312,36 @@ impl App {
 
     // ---- Scroll ----
 
+    /// The largest valid `scroll_back`: everything above the viewport. Derived
+    /// from the last rendered frame's totals.
+    fn max_scroll_back(&self) -> usize {
+        self.total_rows.get().saturating_sub(self.view_height.get())
+    }
+
+    /// Clamp `scroll_back` into `[0, max_scroll_back]`. Called by the UI once per
+    /// frame (through a `Cell`, hence `&self`) after it has recomputed the
+    /// wrapped totals, so a resize — which changes wrapping and thus the max —
+    /// can't leave us scrolled past the top.
+    pub fn clamp_scroll(&self) {
+        let max = self.max_scroll_back();
+        if self.scroll_back.get() > max {
+            self.scroll_back.set(max);
+        }
+    }
+
     pub fn scroll_up(&mut self) {
-        let max = self
-            .total_rows
-            .get()
-            .saturating_sub(self.view_height.get());
-        self.scroll_back = (self.scroll_back.saturating_add(3)).min(max);
+        let max = self.max_scroll_back();
+        self.scroll_back
+            .set(self.scroll_back.get().saturating_add(3).min(max));
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll_back = self.scroll_back.saturating_sub(3);
+        self.scroll_back
+            .set(self.scroll_back.get().saturating_sub(3));
     }
 
     pub fn is_scrolled_back(&self) -> bool {
-        self.scroll_back > 0
+        self.scroll_back.get() > 0
     }
 
     // ---- Input history ----

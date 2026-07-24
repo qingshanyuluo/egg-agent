@@ -177,20 +177,20 @@ fn scroll_clamped_to_total_rows() {
     let mut app = test_app();
     // total_rows / view_height default to 0 → scroll_back stays 0.
     app.scroll_up();
-    assert_eq!(app.scroll_back, 0);
+    assert_eq!(app.scroll_back.get(), 0);
 
     // Simulate a large transcript: 100 visual rows, 20-row viewport.
     app.total_rows.set(100);
     app.view_height.set(20);
     app.scroll_up(); // +3
     app.scroll_up(); // +3
-    assert_eq!(app.scroll_back, 6);
+    assert_eq!(app.scroll_back.get(), 6);
     assert!(app.is_scrolled_back());
 
     app.scroll_down();
-    assert_eq!(app.scroll_back, 3);
+    assert_eq!(app.scroll_back.get(), 3);
     app.scroll_down();
-    assert_eq!(app.scroll_back, 0);
+    assert_eq!(app.scroll_back.get(), 0);
     assert!(!app.is_scrolled_back());
 }
 
