@@ -41,6 +41,83 @@ pub struct Config {
     /// enabled, summarizing with the main model.
     #[serde(default)]
     pub memory: Option<MemoryConfig>,
+    /// Auto-compaction subsystem (`[compaction]`). When absent, defaults apply
+    /// (enabled, tuned for a large-context model).
+    #[serde(default)]
+    pub compaction: Option<CompactionConfig>,
+}
+
+/// Configuration for auto-compaction (`[compaction]` in config.toml).
+///
+/// When a conversation approaches the model's context window, older turns are
+/// distilled into a structured handoff summary while recent turns are kept
+/// verbatim. Defaults are tuned for the newest large-context models (e.g. a
+/// ~200k-token window): we do not assume a small or weak model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    /// Master switch. When false, history grows unbounded (the model/provider
+    /// will error if it overflows).
+    #[serde(default = "default_compaction_enabled")]
+    pub enabled: bool,
+    /// The model's total context window in tokens. Compaction triggers as the
+    /// live context approaches `context_window - reserve_tokens`.
+    #[serde(default = "default_context_window")]
+    pub context_window: usize,
+    /// Tokens held back for the model's response (and headroom for a summary
+    /// pass). Compaction fires before the request would leave less than this.
+    #[serde(default = "default_reserve_tokens")]
+    pub reserve_tokens: usize,
+    /// Recent tokens kept verbatim (never summarized). Older turns above this
+    /// budget are folded into the summary.
+    #[serde(default = "default_keep_recent_tokens")]
+    pub keep_recent_tokens: usize,
+    /// Optional dedicated summarizer model. Empty = use the main model. A
+    /// strong model here yields higher-fidelity handoffs.
+    #[serde(default)]
+    pub model: String,
+    /// Base URL for the summarizer provider. Falls back to the main `base_url`.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// API key for the summarizer provider. Falls back to the main `api_key`.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+fn default_compaction_enabled() -> bool {
+    true
+}
+
+fn default_context_window() -> usize {
+    200_000
+}
+
+fn default_reserve_tokens() -> usize {
+    24_000
+}
+
+fn default_keep_recent_tokens() -> usize {
+    40_000
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_compaction_enabled(),
+            context_window: default_context_window(),
+            reserve_tokens: default_reserve_tokens(),
+            keep_recent_tokens: default_keep_recent_tokens(),
+            model: String::new(),
+            base_url: None,
+            api_key: None,
+        }
+    }
+}
+
+impl CompactionConfig {
+    /// The live-context ceiling that triggers compaction.
+    pub fn trigger_threshold(&self) -> usize {
+        self.context_window.saturating_sub(self.reserve_tokens)
+    }
 }
 
 /// Configuration for a secondary "auxiliary" model used by plugins.
@@ -133,6 +210,7 @@ impl Default for Config {
             aux: None,
             providers: HashMap::new(),
             memory: None,
+            compaction: None,
         }
     }
 }
@@ -257,6 +335,7 @@ mod tests {
             aux: None,
             providers: HashMap::new(),
             memory: None,
+            compaction: None,
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, UnboundedSender};
 
+use crate::compaction::{Compactor, CompactionConfig};
 use crate::llm::{ChatMessage, LlmClient, StreamEvent};
 use crate::tools::ToolRegistry;
 
@@ -57,6 +58,14 @@ pub async fn run_agent(
         history.insert(0, ChatMessage::system(SYSTEM_PROMPT));
     }
 
+    // Initialize compactor with config tuned for Opus 4.8
+    let compactor = Compactor::new(CompactionConfig {
+        trigger_tokens: 180_000,  // Trigger at ~90% of 200k
+        target_tokens: 120_000,   // Compact down to 60%
+        keep_recent_count: 8,     // Keep last 8 turns verbatim
+        keep_recent_tokens: 30_000, // Or 30k tokens, whichever is more
+    });
+
     let defs = tools.defs();
 
     loop {
@@ -74,6 +83,11 @@ pub async fn run_agent(
         };
 
         history.push(msg.clone());
+
+        // Compact if needed
+        if let Ok(new_history) = compactor.compact_if_needed(&history) {
+            history = new_history;
+        }
 
         match msg.tool_calls {
             Some(calls) if !calls.is_empty() => {

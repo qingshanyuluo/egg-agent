@@ -42,6 +42,10 @@ impl ChatMessage {
         Self::text("user", content)
     }
 
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::text("assistant", content)
+    }
+
     pub fn text(role: &str, content: impl Into<String>) -> Self {
         Self {
             role: role.to_string(),

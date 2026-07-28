@@ -7,6 +7,7 @@ pub mod agent;
 pub mod app;
 pub mod cli;
 pub mod clipboard;
+pub mod compaction;
 pub mod config;
 pub mod editor;
 pub mod file_search;
