@@ -98,6 +98,26 @@ pub struct App {
     /// All configured providers: (name, api_key, base_url). Refreshed after
     /// /connect or /connect-remove so the model picker stays in sync.
     pub all_providers: Vec<(String, String, String)>,
+    /// The `@`-file completion popup, when open (feature D). Kept separate from
+    /// `overlay` so it doesn't disturb the modal-overlay input/hitbox contract:
+    /// it's an inline typeahead over the input box, not a modal.
+    pub file_popup: Option<FilePopup>,
+}
+
+/// State for the `@`-file completion popup. `query` is the text typed after the
+/// `@` that opened it; `matches` is the current ranked candidate list (filled
+/// asynchronously off the UI thread); `selected` indexes into `matches`.
+#[derive(Debug, Clone, Default)]
+pub struct FilePopup {
+    /// Byte offset of the `@` in `app.input` that opened this popup. Used to
+    /// splice the chosen path back in and to know how much to replace.
+    pub at: usize,
+    /// The query typed after `@` (does not include the `@` itself).
+    pub query: String,
+    /// Ranked candidate paths, newest search wins.
+    pub matches: Vec<String>,
+    /// Index of the highlighted candidate within `matches`.
+    pub selected: usize,
 }
 
 impl App {
@@ -134,6 +154,7 @@ impl App {
             history_cursor: None,
             draft_input: String::new(),
             all_providers: Vec::new(),
+            file_popup: None,
         }
     }
 
@@ -210,8 +231,9 @@ impl App {
                     }
                 }
                 self.finish_stream_message();
-                self.messages
-                    .push(Message::new(Role::Tool, gfx::tool_call_label(&name, &args)));
+                let mut m = Message::new(Role::Tool, gfx::tool_call_label(&name, &args));
+                m.args = Some(args);
+                self.messages.push(m);
             }
             AgentEvent::ToolResult { output } => {
                 let trimmed = output.trim_end().to_string();
@@ -304,6 +326,114 @@ impl App {
         self.input.clear();
         self.history_cursor = None;
         self.draft_input.clear();
+    }
+
+    /// Replace the input buffer wholesale (e.g. after an external-editor edit),
+    /// resetting history navigation so Up/Down start fresh from this text.
+    pub fn set_input(&mut self, text: String) {
+        self.input = text;
+        self.history_cursor = None;
+    }
+
+    // ---- `@`-file completion popup (feature D) ----
+
+    /// True while the file-completion popup is open (captures ↑↓/Enter/Tab/Esc).
+    pub fn file_popup_active(&self) -> bool {
+        self.file_popup.is_some()
+    }
+
+    /// Open the popup, recording the byte offset of the `@` that triggers it
+    /// (the `@` is assumed to be the last char pushed to `input`).
+    pub fn open_file_popup(&mut self) {
+        let at = self.input.len().saturating_sub('@'.len_utf8());
+        self.file_popup = Some(FilePopup {
+            at,
+            query: String::new(),
+            matches: Vec::new(),
+            selected: 0,
+        });
+    }
+
+    /// The current query text after `@`, if the popup is open.
+    pub fn file_popup_query(&self) -> Option<String> {
+        self.file_popup.as_ref().map(|p| p.query.clone())
+    }
+
+    /// Extend the query by one char (a keystroke while the popup is open) and
+    /// mirror it into the input buffer so the `@query` stays visible.
+    pub fn file_popup_push(&mut self, c: char) {
+        if let Some(p) = self.file_popup.as_mut() {
+            p.query.push(c);
+            p.selected = 0;
+        }
+        self.input.push(c);
+    }
+
+    /// Backspace within the query. Returns `false` (and closes the popup) when
+    /// the `@` itself is deleted, so the caller can treat it as a normal edit.
+    pub fn file_popup_backspace(&mut self) -> bool {
+        let close = match self.file_popup.as_mut() {
+            Some(p) if p.query.is_empty() => true, // backspacing the `@`
+            Some(p) => {
+                p.query.pop();
+                p.selected = 0;
+                false
+            }
+            None => return false,
+        };
+        self.input.pop();
+        if close {
+            self.file_popup = None;
+        }
+        true
+    }
+
+    /// Replace the popup's candidate list (from an async search result). Ignored
+    /// if the popup was closed meanwhile.
+    pub fn set_file_matches(&mut self, matches: Vec<String>) {
+        if let Some(p) = self.file_popup.as_mut() {
+            p.selected = p.selected.min(matches.len().saturating_sub(1));
+            p.matches = matches;
+        }
+    }
+
+    pub fn file_popup_up(&mut self) {
+        if let Some(p) = self.file_popup.as_mut() {
+            p.selected = p.selected.saturating_sub(1);
+        }
+    }
+
+    pub fn file_popup_down(&mut self) {
+        if let Some(p) = self.file_popup.as_mut()
+            && !p.matches.is_empty()
+        {
+            p.selected = (p.selected + 1).min(p.matches.len() - 1);
+        }
+    }
+
+    /// Accept the highlighted candidate: replace `@query` in the input with the
+    /// chosen path (plus a trailing space) and close the popup. No-op with an
+    /// empty candidate list.
+    pub fn file_popup_accept(&mut self) {
+        let Some(p) = self.file_popup.take() else {
+            return;
+        };
+        let Some(choice) = p.matches.get(p.selected).cloned() else {
+            // Nothing to insert; leave the typed `@query` as-is.
+            self.file_popup = None;
+            return;
+        };
+        // Replace from the `@` to the end of input (the query is always the tail
+        // while the popup is open) with "path ".
+        self.input.truncate(p.at);
+        self.input.push_str(&choice);
+        self.input.push(' ');
+        self.history_cursor = None;
+    }
+
+    /// Close the popup without inserting, leaving the typed `@query` in place.
+    pub fn close_file_popup(&mut self) {
+        self.file_popup = None;
     }
 
     pub fn quit(&mut self) {
@@ -430,10 +560,12 @@ impl App {
                     // Tool calls embedded in the assistant turn.
                     if let Some(ref calls) = msg.tool_calls {
                         for tc in calls {
-                            self.messages.push(Message::new(
+                            let mut m = Message::new(
                                 Role::Tool,
                                 gfx::tool_call_label(&tc.function.name, &tc.function.arguments),
-                            ));
+                            );
+                            m.args = Some(tc.function.arguments.clone());
+                            self.messages.push(m);
                         }
                     }
                 }

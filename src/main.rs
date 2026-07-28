@@ -6,13 +6,21 @@ use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton,
-    MouseEventKind,
+    Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set once at startup if the terminal accepted the kitty keyboard-enhancement
+/// flags, so cleanup knows whether it must pop them. Terminals without kitty
+/// support (e.g. the stock macOS Terminal.app) fall back to Alt/Esc+Enter for
+/// newline insertion.
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -35,6 +43,12 @@ use egg_agent::ui;
 fn restore_terminal() {
     use std::io::Write;
     let mut out = io::stdout();
+    // Pop keyboard-enhancement flags before leaving raw mode, but only if we
+    // pushed them — popping unconditionally is harmless on supporting terminals
+    // yet wasteful, and skipping it entirely would leak the mode on exit.
+    if KEYBOARD_ENHANCED.load(Ordering::Relaxed) {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
     let _ = disable_raw_mode();
     let _ = execute!(
         out,
@@ -44,6 +58,30 @@ fn restore_terminal() {
         Show
     );
     let _ = out.flush();
+}
+
+/// Re-enter the TUI after it was suspended by [`restore_terminal`] (e.g. to run
+/// an external editor). Mirrors `TerminalGuard::new`'s setup but reuses the
+/// existing `Terminal`, re-pushing the kitty flags only if we had them, and
+/// clears so the next `draw` repaints from a clean alternate screen.
+fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        Hide
+    )?;
+    if KEYBOARD_ENHANCED.load(Ordering::Relaxed) {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
+    terminal.clear()?;
+    Ok(())
 }
 
 /// RAII guard that owns the terminal's raw/alternate-screen state.
@@ -67,6 +105,32 @@ impl TerminalGuard {
             EnableBracketedPaste,
             Hide
         )?;
+
+        // On terminals that speak the kitty keyboard protocol, ask only for
+        // DISAMBIGUATE_ESCAPE_CODES. That is the minimal flag that makes the
+        // terminal report modifiers on keys like Enter (so Shift+Enter arrives
+        // with a real SHIFT modifier instead of a bare `\r`), while leaving the
+        // other kitty modes off — crucially REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+        // which is what previously broke bracketed paste. `EnableBracketedPaste`
+        // above still stands, so paste continues to arrive as `Event::Paste`.
+        //
+        // Terminals without support (e.g. macOS Terminal.app) simply don't get
+        // Shift+Enter; the Alt/Esc+Enter fallback in the event loop covers them.
+        let supported = supports_keyboard_enhancement().unwrap_or(false);
+        log::debug!("keyboard enhancement supported = {supported}");
+        if supported
+            && execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            )
+            .is_ok()
+        {
+            KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
+            log::debug!("pushed DISAMBIGUATE_ESCAPE_CODES");
+        }
+
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
     }
@@ -199,7 +263,33 @@ async fn run_tui_with(pending_history: Option<Vec<ChatMessage>>) -> Result<()> {
         log::info!("no aux model configured — translation/explain plugins will be silent");
     }
 
-    let plugins = plugin::Registry::builtin();
+    let mut plugins = plugin::Registry::builtin();
+
+    // Memory plugin: a finished turn with many tool calls is first screened
+    // by the cheap aux model ("genuine trial-and-error ending in success?"),
+    // then distilled by a (ideally stronger) summarizer model into an
+    // experience note under ~/.egg-agent/memory/<global|project>/<category>/
+    // (a skill-style topic tree, not a date-based log). Without `[memory]`
+    // the main model summarizes; without `[aux]` the screening stage is skipped.
+    {
+        let mc = config.memory.clone().unwrap_or_default();
+        if mc.enabled {
+            let memory_llm: Arc<dyn LlmClient> = if mc.model.trim().is_empty() {
+                llm.clone()
+            } else {
+                let base = mc.base_url.as_deref().unwrap_or(&config.base_url);
+                let key = mc.api_key.as_deref().unwrap_or(&config.api_key);
+                log::info!("memory summarizer model: {} @ {base}", mc.model);
+                Arc::new(OpenAiClient::with_params(base, key, &mc.model)) as Arc<dyn LlmClient>
+            };
+            plugins.add(Box::new(plugin::memory::MemoryPlugin::new(
+                memory_llm,
+                aux_client.clone(),
+                mc.min_tool_calls,
+            )));
+        }
+    }
+
     let (plugin_tx, mut plugin_rx) = mpsc::unbounded_channel::<PluginEvent>();
 
     // On panic, restore the terminal first so the backtrace is readable and the
@@ -304,6 +394,13 @@ async fn run(
         while let Ok(event) = ctl_rx.try_recv() {
             match event {
                 CtlEvent::ModelList(result) => app.set_model_list(result),
+                CtlEvent::FileMatches { query, matches } => {
+                    // Drop stale results: only apply if the popup's live query
+                    // still matches the one this search was issued for.
+                    if app.file_popup_query().as_deref() == Some(query.as_str()) {
+                        app.set_file_matches(matches);
+                    }
+                }
             }
             dirty = true;
         }
@@ -320,6 +417,7 @@ async fn run(
                         match field {
                             "translation" => msg.translation = Some(text.clone()),
                             "explanation" => msg.explanation = Some(text.clone()),
+                            "memory" => msg.memory = Some(text.clone()),
                             other => log::warn!("unknown plugin message field: {other}"),
                         }
                     } else {
@@ -353,6 +451,10 @@ async fn run(
         }
         match event::read()? {
             Event::Key(key) => {
+                log::debug!(
+                    "raw key: code={:?} mods={:?} kind={:?} state={:?}",
+                    key.code, key.modifiers, key.kind, key.state
+                );
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -363,6 +465,33 @@ async fn run(
                     if let Some(ok) = to_overlay_key(key.code) {
                         let action = app.overlay_key(ok);
                         handle_overlay_action(action, app, &client, &ctl_tx, plugins);
+                    }
+                    continue;
+                }
+
+                // While the `@`-file popup is open it captures navigation and
+                // typing; anything that changes the query re-issues the search.
+                if app.file_popup_active() {
+                    match key.code {
+                        KeyCode::Esc => app.close_file_popup(),
+                        KeyCode::Up => app.file_popup_up(),
+                        KeyCode::Down => app.file_popup_down(),
+                        KeyCode::Enter | KeyCode::Tab => app.file_popup_accept(),
+                        KeyCode::Backspace => {
+                            // Deleting past the `@` closes the popup; otherwise
+                            // refine the query.
+                            app.file_popup_backspace();
+                            if let Some(q) = app.file_popup_query() {
+                                spawn_file_search(q, &ctl_tx);
+                            }
+                        }
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.file_popup_push(c);
+                            if let Some(q) = app.file_popup_query() {
+                                spawn_file_search(q, &ctl_tx);
+                            }
+                        }
+                        _ => {}
                     }
                     continue;
                 }
@@ -385,14 +514,54 @@ async fn run(
                             app.quit();
                         }
                     }
+                    // Ctrl+J inserts a newline. Unlike Shift+Enter (needs the kitty
+                    // keyboard protocol) or Alt/Esc+Enter (intercepted by some
+                    // terminals), Ctrl+J maps to the raw control byte 0x0A and
+                    // arrives intact on every terminal — the reliable fallback.
+                    KeyCode::Char('j')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !app.running
+                            && !app.overlay_active() =>
+                    {
+                        last_esc = None;
+                        app.input_newline();
+                    }
+                    // Ctrl+X / Ctrl+E: edit the input buffer in $EDITOR. Suspend
+                    // the TUI, hand the real tty to the editor, then restore and
+                    // repaint. Errors surface as a System message, never a panic.
+                    KeyCode::Char('x' | 'e')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !app.running
+                            && !app.overlay_active() =>
+                    {
+                        last_esc = None;
+                        restore_terminal();
+                        let edited = egg_agent::editor::edit_string(&app.input);
+                        let resumed = resume_terminal(terminal);
+                        match edited {
+                            Ok(text) => app.set_input(text),
+                            Err(e) => {
+                                app.messages.push(Message::new(
+                                    Role::System,
+                                    format!("editor: {e}"),
+                                ));
+                            }
+                        }
+                        // If re-entering the alternate screen failed, we can't
+                        // keep drawing — surface it and quit cleanly.
+                        resumed?;
+                    }
                     // Typing "/" on an empty input opens the command palette.
                     KeyCode::Char('/') if app.input.is_empty() && !app.running => {
                         app.open_command_menu();
                     }
                     KeyCode::Enter => {
-                        // Detect Alt+Enter / Option+Enter: Esc followed quickly
-                        // by Enter inserts a newline. Shift+Enter still works
-                        // natively in most terminals without the kitty protocol.
+                        // Two ways to insert a newline instead of submitting:
+                        //   - Shift+Enter, when the terminal reports the SHIFT
+                        //     modifier (requires the kitty keyboard enhancement
+                        //     pushed at startup; unavailable on e.g. Terminal.app).
+                        //   - Alt/Option+Enter, detected as Esc followed quickly
+                        //     by Enter — the portable fallback for the rest.
                         let esc_newline = last_esc
                             .map(|t| t.elapsed() < Duration::from_millis(200))
                             .unwrap_or(false);
@@ -444,6 +613,16 @@ async fn run(
                     KeyCode::Down if !app.running => {
                         last_esc = None;
                         app.history_down();
+                    }
+                    KeyCode::Char('@') if !app.running => {
+                        if last_esc.take().is_some() {
+                            app.clear_input();
+                        }
+                        // Push the `@`, open the popup anchored on it, and kick
+                        // off an initial (empty-query) search to fill the list.
+                        app.input.push('@');
+                        app.open_file_popup();
+                        spawn_file_search(String::new(), &ctl_tx);
                     }
                     KeyCode::Char(c) if !app.running => {
                         // If Esc was just pressed (without Enter), clear input first.
@@ -506,6 +685,21 @@ async fn run(
 /// Control-channel events for slash-command async results.
 enum CtlEvent {
     ModelList(Result<Vec<String>, String>),
+    /// Ranked `@`-file completion candidates for a given query. The query is
+    /// echoed back so a stale result (the user typed on) can be discarded.
+    FileMatches { query: String, matches: Vec<String> },
+}
+
+/// Spawn a fuzzy file search off the UI thread and deliver the ranked matches
+/// over the control channel. The cwd walk is filesystem I/O, so it runs on a
+/// blocking task; ranking is cheap and piggybacks on the same task.
+fn spawn_file_search(query: String, ctl_tx: &mpsc::UnboundedSender<CtlEvent>) {
+    let tx = ctl_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let files = egg_agent::file_search::walk_files(std::path::Path::new("."));
+        let matches = egg_agent::file_search::rank(&files, &query, 8);
+        let _ = tx.send(CtlEvent::FileMatches { query, matches });
+    });
 }
 
 /// Map a crossterm key into the overlay's normalized key, if relevant.

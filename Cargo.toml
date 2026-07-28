@@ -1,6 +1,6 @@
 [package]
 name = "egg-agent"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 
 [[bin]]
@@ -26,6 +26,14 @@ unicode-width = "0.1"
 futures-util = "0.3"
 log = "0.4"
 env_logger = "0.11"
+# HTML -> Markdown conversion for the web_fetch tool, so fetched pages arrive
+# in a compact, LLM-friendly form (same idea as opencode's Turndown usage).
+html2md = "0.2"
+# Pure-Rust line diffing for the edit_file/write_file diff view in the
+# transcript (feature A). Same crate the codex TUI uses.
+similar = "2"
+# Fuzzy matcher for @-file completion in the input box (feature D).
+nucleo-matcher = "0.3"
 
 [dev-dependencies]
 tokio-test = "0.4"

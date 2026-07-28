@@ -37,6 +37,10 @@ pub struct Config {
     /// user-chosen name (e.g. "deepseek", "groq").
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+    /// Auto-memory subsystem (`[memory]`). When absent, defaults apply:
+    /// enabled, summarizing with the main model.
+    #[serde(default)]
+    pub memory: Option<MemoryConfig>,
 }
 
 /// Configuration for a secondary "auxiliary" model used by plugins.
@@ -55,6 +59,53 @@ pub struct AuxConfig {
     /// API key for the aux provider. Falls back to the main `api_key`.
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+/// Configuration for the auto-memory subsystem (`[memory]` in config.toml).
+///
+/// A finished turn with many tool calls is first screened by the cheap aux
+/// model ("was this genuine trial-and-error that ended in success?"); only
+/// then is the trajectory handed to the summarizer — ideally a *stronger*
+/// model — which distills a reusable experience note into
+/// `~/.egg-agent/memory/`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// Summarizer model ID. An empty string means "use the main model".
+    #[serde(default)]
+    pub model: String,
+    /// Base URL for the summarizer provider. Falls back to the main `base_url`.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// API key for the summarizer provider. Falls back to the main `api_key`.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// A finished turn must involve at least this many tool calls to be
+    /// considered a "complex exploration" worth screening.
+    #[serde(default = "default_min_tool_calls")]
+    pub min_tool_calls: u32,
+    /// Master switch (also toggleable at runtime via `/memory`).
+    #[serde(default = "default_memory_enabled")]
+    pub enabled: bool,
+}
+
+fn default_min_tool_calls() -> u32 {
+    6
+}
+
+fn default_memory_enabled() -> bool {
+    true
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            base_url: None,
+            api_key: None,
+            min_tool_calls: default_min_tool_calls(),
+            enabled: default_memory_enabled(),
+        }
+    }
 }
 
 /// A named API provider stored under `[providers.<name>]`.
@@ -81,6 +132,7 @@ impl Default for Config {
             model: default_model(),
             aux: None,
             providers: HashMap::new(),
+            memory: None,
         }
     }
 }
@@ -204,6 +256,7 @@ mod tests {
             model: "some-model".to_string(),
             aux: None,
             providers: HashMap::new(),
+            memory: None,
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();

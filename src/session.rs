@@ -139,7 +139,7 @@ pub fn list() -> Result<Vec<SessionInfo>> {
 }
 
 /// Timestamp string safe for filenames.
-fn chrono_now() -> String {
+pub(crate) fn chrono_now() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();

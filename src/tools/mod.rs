@@ -7,7 +7,10 @@
 pub mod bash;
 pub mod edit;
 pub mod fs;
+pub mod memory;
 pub mod search;
+pub mod web_fetch;
+pub mod web_search;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -52,6 +55,10 @@ impl ToolRegistry {
                 Box::new(edit::EditFile),
                 Box::new(bash::Bash),
                 Box::new(search::Search),
+                Box::new(web_search::WebSearch),
+                Box::new(web_fetch::WebFetch),
+                Box::new(memory::MemorySearch),
+                Box::new(memory::SkillTree),
             ],
         }
     }

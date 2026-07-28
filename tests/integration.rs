@@ -438,3 +438,195 @@ fn esc_clears_input_and_history_cursor() {
     // history_down after clear should be a no-op (cursor reset)
     app.history_down(); // should not panic
 }
+
+// ============================================================================
+// 6. Memory plugin: complex turn → aux screening → async experience archival
+// ============================================================================
+
+/// A canned LLM standing in for the screener or the summarizer.
+struct MockLlm(&'static str);
+
+#[async_trait::async_trait]
+impl egg_agent::llm::LlmClient for MockLlm {
+    async fn chat_stream(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: &[egg_agent::llm::ToolDef],
+        _events: &tokio::sync::mpsc::UnboundedSender<egg_agent::llm::StreamEvent>,
+    ) -> anyhow::Result<ChatMessage> {
+        Ok(ChatMessage::text("assistant", self.0))
+    }
+}
+
+const SCREENER_YES: MockLlm = MockLlm("YES\n多次试错后才成功，有参考价值");
+const SCREENER_NO: MockLlm = MockLlm("NO\n一帆风顺，没有实质试错");
+// No `scope:`/`category:` lines on purpose: exercises the fail-safe
+// defaults (project scope, misc category).
+const SUMMARIZER: MockLlm = MockLlm("# 测试经验标题\n\n## 任务背景\n构建失败排查。");
+const SUMMARIZER_GLOBAL: MockLlm =
+    MockLlm("# 通用经验标题\nscope: global\ncategory: shell/quoting\n\n## 任务背景\n跨项目通用。");
+
+/// Remove the archived note referenced by a "✅ 经验已归档 → <path>" text,
+/// plus any ancestor dirs that end up empty, stopping at the memory root
+/// (remove_dir only succeeds on empty dirs, so real notes are never touched).
+fn cleanup_note(text: &str) {
+    let Some(path_str) = text.split("→ ").nth(1).and_then(|s| s.lines().next()) else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path_str.trim());
+    let _ = std::fs::remove_file(&path);
+    let root = egg_agent::memory::dir().unwrap_or_default();
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d == root || std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
+}
+
+/// History shaped like a struggle: `calls` tool calls, `fails` of them failing.
+fn struggle_history(calls: usize, fails: usize) -> Vec<ChatMessage> {
+    let mut h = vec![ChatMessage::user("fix the flaky build")];
+    for i in 0..calls {
+        h.push(ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![egg_agent::llm::ToolCall {
+                id: format!("c{i}"),
+                kind: "function".into(),
+                function: egg_agent::llm::FunctionCall {
+                    name: "bash".into(),
+                    arguments: r#"{"command":"cargo build"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+        });
+        let out = if i < fails {
+            "exit code: 101\n--- stderr ---\nerror[E0308]: mismatched types"
+        } else {
+            "exit code: 0"
+        };
+        h.push(ChatMessage::tool_result(format!("c{i}"), out));
+    }
+    h.push(ChatMessage::text("assistant", "修好了。"));
+    h
+}
+
+/// Run one Done event through a memory-enabled registry and collect the
+/// resulting plugin event (if any). Returns the app plus the event.
+async fn run_memory_turn(
+    screener: Option<MockLlm>,
+    history: Vec<ChatMessage>,
+) -> (App, Option<plugin::PluginEvent>) {
+    run_memory_turn_with(SUMMARIZER, screener, history).await
+}
+
+async fn run_memory_turn_with(
+    summarizer: MockLlm,
+    screener: Option<MockLlm>,
+    history: Vec<ChatMessage>,
+) -> (App, Option<plugin::PluginEvent>) {
+    let mut registry = plugin::Registry::builtin();
+    registry.add(Box::new(plugin::memory::MemoryPlugin::new(
+        std::sync::Arc::new(summarizer),
+        screener.map(|s| std::sync::Arc::new(s) as std::sync::Arc<dyn egg_agent::llm::LlmClient>),
+        3, // min_tool_calls
+    )));
+    let mut app = test_app();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<plugin::PluginEvent>();
+
+    registry.on_agent_event(&AgentEvent::Done(history), &mut app, None, &tx);
+
+    // Mocks resolve instantly, so a short timeout suffices for positive cases
+    // and keeps the negative case (no event at all) fast.
+    let ev = match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
+        Ok(ev) => ev,
+        Err(_) => None, // timed out: no async work was spawned
+    };
+    (app, ev)
+}
+
+#[tokio::test]
+async fn memory_archives_when_screening_passes() {
+    // Note: zero failures — call count alone gates the pipeline now.
+    let (app, ev) = run_memory_turn(Some(SCREENER_YES), struggle_history(4, 0)).await;
+
+    let status = app.messages.last().expect("status message");
+    assert_eq!(status.role, Role::System);
+    assert!(status.content.contains("小模型筛选中"), "got: {}", status.content);
+
+    let Some(plugin::PluginEvent::Custom { field, text, .. }) = ev else {
+        panic!("expected archival event, got {ev:?}");
+    };
+    assert_eq!(field, "memory");
+    assert!(text.contains("已归档"), "got: {text}");
+    assert!(text.contains("测试经验标题"), "title missing: {text}");
+    // No scope/category lines in the mock note → fail-safe defaults:
+    // project dir (tests run with the crate root as cwd, a git repo) and
+    // the misc category.
+    assert!(text.contains("/egg-agent/misc/"), "project/misc dir missing: {text}");
+    assert!(!text.contains("/global/"), "must not be global: {text}");
+
+    // Clean up the note written to the real memory dir.
+    cleanup_note(&text);
+}
+
+#[tokio::test]
+async fn memory_global_scope_goes_to_global_dir() {
+    let (_app, ev) =
+        run_memory_turn_with(SUMMARIZER_GLOBAL, None, struggle_history(4, 1)).await;
+    let Some(plugin::PluginEvent::Custom { text, .. }) = ev else {
+        panic!("expected archival event, got {ev:?}");
+    };
+    assert!(text.contains("已归档"), "got: {text}");
+    assert!(text.contains("/global/shell/quoting/"), "category path missing: {text}");
+    cleanup_note(&text);
+}
+
+#[tokio::test]
+async fn memory_drops_when_screened_out() {
+    let (app, ev) = run_memory_turn(Some(SCREENER_NO), struggle_history(5, 3)).await;
+
+    assert!(app.messages.last().is_some());
+    let Some(plugin::PluginEvent::Custom { field, text, .. }) = ev else {
+        panic!("expected rejection event, got {ev:?}");
+    };
+    assert_eq!(field, "memory");
+    assert!(text.contains("不值得归档"), "got: {text}");
+    assert!(!text.contains("已归档"), "must not archive: {text}");
+}
+
+#[tokio::test]
+async fn memory_archives_directly_without_screener() {
+    let (_app, ev) = run_memory_turn(None, struggle_history(4, 1)).await;
+    let Some(plugin::PluginEvent::Custom { text, .. }) = ev else {
+        panic!("expected archival event, got {ev:?}");
+    };
+    assert!(text.contains("已归档"), "got: {text}");
+    cleanup_note(&text);
+}
+
+#[tokio::test]
+async fn memory_ignores_easy_turns() {
+    // Below the call threshold: nothing happens at all.
+    let (app, ev) = run_memory_turn(Some(SCREENER_YES), struggle_history(2, 1)).await;
+    assert!(app.messages.is_empty(), "no status message for easy turns");
+    assert!(ev.is_none(), "no async work for easy turns");
+}
+
+#[test]
+fn memory_command_toggles() {
+    let mut registry = plugin::Registry::builtin();
+    registry.add(Box::new(plugin::memory::MemoryPlugin::new(
+        std::sync::Arc::new(SUMMARIZER),
+        None,
+        3,
+    )));
+    let mut app = test_app();
+    assert!(registry.dispatch_command("memory", &mut app));
+    assert!(app.messages.last().unwrap().content.contains("off"));
+    assert!(registry.dispatch_command("memory", &mut app));
+    assert!(app.messages.last().unwrap().content.contains("on"));
+}

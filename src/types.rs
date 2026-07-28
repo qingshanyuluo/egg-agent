@@ -32,6 +32,8 @@ pub struct Message {
     pub translation: Option<String>,
     /// Human-readable explanation of a tool call, populated by BashExplainPlugin.
     pub explanation: Option<String>,
+    /// Archival result note, populated by MemoryPlugin on its status message.
+    pub memory: Option<String>,
     /// Full tool output (only for `Role::ToolOutput`), kept even when the
     /// on-screen preview is collapsed.
     pub full_content: Option<String>,
@@ -42,6 +44,12 @@ pub struct Message {
     /// Tool calls default to expanded (false); bash commands with long args
     /// can be collapsed by the user.
     pub tool_collapsed: bool,
+    /// Raw JSON arguments of a tool call (only for `Role::Tool`). Lets the
+    /// renderer reconstruct a diff (edit_file/write_file) or an exec header
+    /// (bash) instead of only showing the compact one-line label. The tool
+    /// *name* is derived from the first token of `content` (see
+    /// `gfx::tool_call_label`'s `"name  …"` contract).
+    pub args: Option<String>,
 }
 
 impl Message {
@@ -54,9 +62,11 @@ impl Message {
             reasoning_secs: None,
             translation: None,
             explanation: None,
+            memory: None,
             full_content: None,
             output_collapsed: true,
             tool_collapsed: false,
+            args: None,
         }
     }
 }

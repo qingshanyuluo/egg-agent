@@ -23,6 +23,7 @@
 
 pub mod bash_explain;
 pub mod clipboard;
+pub mod memory;
 pub mod reasoning;
 pub mod translate;
 
@@ -124,6 +125,13 @@ impl Registry {
                 Box::new(bash_explain::BashExplainPlugin::new()),
             ],
         }
+    }
+
+    /// Register an extra plugin after the built-ins. Used for plugins that
+    /// are constructed with their own resources (e.g. the memory plugin,
+    /// which holds its own summarizer LLM client).
+    pub fn add(&mut self, plugin: Box<dyn Plugin>) {
+        self.plugins.push(plugin);
     }
 
     // --- Agent / mouse dispatch ---
